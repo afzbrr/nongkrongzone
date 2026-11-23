@@ -41,47 +41,103 @@ async function apiFetch<T>(
   options: RequestInit = {},
   timeoutMs = 15000
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string> | undefined),
-  };
-  if (activeSessionTokenMemory) {
-    headers['Authorization'] = `Bearer ${activeSessionTokenMemory}`;
-  }
-  if (activePlayerIdMemory) {
-    headers['x-player-id'] = activePlayerIdMemory;
-  }
+  const method = (options.method || 'GET').toUpperCase();
+  const hasBody = options.body !== undefined && options.body !== null;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
-  try {
-    res = await fetch(url, { ...options, headers, signal: controller.signal });
-  } catch (err: any) {
-    clearTimeout(timer);
-    if (err?.name === 'AbortError') {
-      throw new Error('Koneksi timeout. Periksa jaringan lalu coba lagi.');
-    }
-    throw new Error(err?.message || 'Gagal terhubung ke server');
-  }
-  clearTimeout(timer);
-
-  const contentType = res.headers.get('content-type') || '';
-  if (contentType.includes('text/html')) {
-    throw new Error('Server sedang menyiapkan koneksi. Coba lagi sebentar.');
-  }
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data?.message || data?.error || 'Permintaan gagal') as Error & {
-      code?: string;
-      status?: number;
+  const attempt = async (): Promise<T> => {
+    const headers: Record<string, string> = {
+      ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers as Record<string, string> | undefined),
     };
-    err.code = data?.error;
-    err.status = res.status;
-    throw err;
+    if (activeSessionTokenMemory) {
+      headers['Authorization'] = `Bearer ${activeSessionTokenMemory}`;
+    }
+    if (activePlayerIdMemory) {
+      headers['x-player-id'] = activePlayerIdMemory;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        ...options,
+        credentials: 'same-origin',
+        headers,
+        signal: controller.signal,
+      });
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err?.name === 'AbortError') {
+        const timeoutErr = new Error('Koneksi timeout. Periksa jaringan lalu coba lagi.') as Error & {
+          isRetryable?: boolean;
+        };
+        timeoutErr.isRetryable = true;
+        throw timeoutErr;
+      }
+      const netErr = new Error(err?.message || 'Gagal terhubung ke server') as Error & {
+        isRetryable?: boolean;
+      };
+      netErr.isRetryable = true;
+      throw netErr;
+    }
+    clearTimeout(timer);
+
+    const rawText = await res.text().catch(() => '');
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const looksLikeHtml = contentType.includes('text/html') || /^\s*</.test(rawText);
+
+    if (looksLikeHtml) {
+      const htmlErr = new Error(
+        'Server sedang menyiapkan koneksi. Coba lagi sebentar.'
+      ) as Error & {
+        status?: number;
+        isProxyHtml?: boolean;
+        isRetryable?: boolean;
+      };
+      htmlErr.status = res.status;
+      htmlErr.isProxyHtml = true;
+      htmlErr.isRetryable = true;
+      throw htmlErr;
+    }
+
+    let data: any = {};
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = {};
+      }
+    }
+
+    if (!res.ok) {
+      const serverMsg = data?.message || data?.error;
+      const snippet = !serverMsg && rawText.trim() ? rawText.trim().slice(0, 120) : '';
+      const message =
+        serverMsg || (snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status} (${url})`);
+      const err = new Error(message) as Error & {
+        code?: string;
+        status?: number;
+        isRetryable?: boolean;
+      };
+      err.code = data?.error;
+      err.status = res.status;
+      err.isRetryable = res.status === 502 || res.status === 503 || res.status === 504 || res.status === 429;
+      throw err;
+    }
+
+    return data as T;
+  };
+
+  try {
+    return await attempt();
+  } catch (firstErr: any) {
+    if (method === 'GET' && firstErr?.isRetryable) {
+      await new Promise((r) => setTimeout(r, 350));
+      return await attempt();
+    }
+    throw firstErr;
   }
-  return data as T;
 }
 
 export async function uploadMediaFile(file: File): Promise<{ url: string; mediaType: string }> {
@@ -107,7 +163,9 @@ export async function uploadMediaFile(file: File): Promise<{ url: string; mediaT
 
 export const api = {
   health: () =>
-    apiFetch<{ ok: boolean; supabaseConfigured: boolean; missing: string[] }>('/api/health'),
+    apiFetch<{ ok: boolean; supabaseConfigured: boolean; missing: string[] }>('/api/health', {
+      cache: 'no-store',
+    }),
 
   telegramLogin: (payload: { initData?: string; user: TelegramWebAppUser }) =>
     apiFetch<{ player: Player; sessionToken: string; players: Player[] }>('/api/auth/telegram', {
@@ -115,7 +173,24 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getMe: () => apiFetch<{ player: Player; sessionToken?: string; players: Player[] }>('/api/auth/me'),
+  telegramLoginGet: (payload: { initData?: string; user: TelegramWebAppUser }) => {
+    const sp = new URLSearchParams();
+    if (payload.initData) sp.set('initData', payload.initData);
+    sp.set('tg_id', String(payload.user.id));
+    if (payload.user.username) sp.set('username', payload.user.username);
+    if (payload.user.first_name) sp.set('first_name', payload.user.first_name);
+    if (payload.user.last_name) sp.set('last_name', payload.user.last_name);
+    if (payload.user.photo_url) sp.set('photo_url', payload.user.photo_url);
+    return apiFetch<{ player: Player; sessionToken: string; players: Player[] }>(
+      `/api/auth/telegram-login?${sp.toString()}`,
+      { cache: 'no-store' }
+    );
+  },
+
+  getMe: () =>
+    apiFetch<{ player: Player; sessionToken?: string; players: Player[] }>('/api/auth/me', {
+      cache: 'no-store',
+    }),
 
   updateMe: (payload: { full_name?: string; name?: string; bio?: string; avatar_url?: string | null }) =>
     apiFetch<{ player: Player }>('/api/players/me', {

@@ -117,10 +117,11 @@ export default function App() {
       try {
         const hashRaw = window.location.hash.replace(/^#/, '');
         const hashParams = new URLSearchParams(hashRaw);
-        const fromHash = hashParams.get('tgWebAppData');
-        if (fromHash) initData = fromHash;
+        const searchParams = new URLSearchParams(window.location.search);
+        const fromParams = hashParams.get('tgWebAppData') || searchParams.get('tgWebAppData');
+        if (fromParams) initData = fromParams;
       } catch {
-        // ignore hash parse errors
+        // ignore url parse errors
       }
     }
 
@@ -134,7 +135,7 @@ export default function App() {
       }
     }
 
-    return { initData, tgUser };
+    return { initData, tgUser, hasTgWebApp: Boolean(tgWebApp) };
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -142,27 +143,37 @@ export default function App() {
     setBootError(null);
     setSlowLoading(false);
     try {
-      const health = await api.health();
-      if (!health.supabaseConfigured) {
-        setMissingEnv(health.missing);
-        setBootState('unconfigured');
-        return;
+      let auth = extractTelegramAuth();
+      if (auth.hasTgWebApp && !auth.tgUser?.id) {
+        await new Promise((r) => setTimeout(r, 150));
+        auth = extractTelegramAuth();
       }
 
-      const { initData, tgUser } = extractTelegramAuth();
+      const { initData, tgUser } = auth;
+      let meRes: { player: Player; sessionToken?: string; players: Player[] };
 
-      const meRes = tgUser?.id
-        ? await api.telegramLogin({
-            initData,
-            user: {
-              id: Number(tgUser.id),
-              username: tgUser.username,
-              first_name: tgUser.first_name,
-              last_name: tgUser.last_name,
-              photo_url: tgUser.photo_url,
-            },
-          })
-        : await api.getMe();
+      if (tgUser?.id) {
+        const payload = {
+          initData,
+          user: {
+            id: Number(tgUser.id),
+            username: tgUser.username,
+            first_name: tgUser.first_name,
+            last_name: tgUser.last_name,
+            photo_url: tgUser.photo_url,
+          },
+        };
+        try {
+          meRes = await api.telegramLogin(payload);
+        } catch (postErr: any) {
+          if (postErr?.code === 'SUPABASE_NOT_CONFIGURED' || postErr?.status === 401) {
+            throw postErr;
+          }
+          meRes = await api.telegramLoginGet(payload);
+        }
+      } else {
+        meRes = await api.getMe();
+      }
 
       autoRetryCountRef.current = 0;
       setActivePlayerId(meRes.player.id);
@@ -234,43 +245,47 @@ export default function App() {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws?playerId=${currentUser.id}`);
-      wsRef.current = ws;
+      try {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${window.location.host}/ws?playerId=${currentUser.id}`);
+        wsRef.current = ws;
 
-      ws.onmessage = (e) => {
-        try {
-          const parsed = JSON.parse(e.data);
-          wsSeqRef.current += 1;
-          setWsEvent({ event: parsed.event, payload: parsed.payload, seq: wsSeqRef.current });
+        ws.onmessage = (e) => {
+          try {
+            const parsed = JSON.parse(e.data);
+            wsSeqRef.current += 1;
+            setWsEvent({ event: parsed.event, payload: parsed.payload, seq: wsSeqRef.current });
 
-          if (parsed.event === 'notification:new' && parsed.payload) {
-            setNotifications((prev) => [parsed.payload, ...prev]);
-            setUnreadNotifs((c) => c + 1);
-          } else if (parsed.event === 'message:new' && parsed.payload) {
-            if (parsed.payload.sender_id !== currentUser.id) {
+            if (parsed.event === 'notification:new' && parsed.payload) {
+              setNotifications((prev) => [parsed.payload, ...prev]);
+              setUnreadNotifs((c) => c + 1);
+            } else if (parsed.event === 'message:new' && parsed.payload) {
+              if (parsed.payload.sender_id !== currentUser.id) {
+                loadNotificationsAndChats();
+              }
+            } else if (parsed.event === 'chat:read') {
               loadNotificationsAndChats();
+            } else if (parsed.event === 'post:created' && parsed.payload) {
+              setPosts((prev) => {
+                if (prev.some((p) => p.id === parsed.payload.id)) return prev;
+                return [parsed.payload, ...prev];
+              });
+            } else if (parsed.event === 'post:deleted' && parsed.payload?.id) {
+              setPosts((prev) => prev.filter((p) => p.id !== parsed.payload.id));
             }
-          } else if (parsed.event === 'chat:read') {
-            loadNotificationsAndChats();
-          } else if (parsed.event === 'post:created' && parsed.payload) {
-            setPosts((prev) => {
-              if (prev.some((p) => p.id === parsed.payload.id)) return prev;
-              return [parsed.payload, ...prev];
-            });
-          } else if (parsed.event === 'post:deleted' && parsed.payload?.id) {
-            setPosts((prev) => prev.filter((p) => p.id !== parsed.payload.id));
+          } catch {
+            // ignore malformed ws message
           }
-        } catch {
-          // ignore malformed ws message
-        }
-      };
+        };
 
-      ws.onclose = () => {
-        if (!closedByCleanup) {
-          reconnectTimer = setTimeout(connect, 2500);
-        }
-      };
+        ws.onclose = () => {
+          if (!closedByCleanup) {
+            reconnectTimer = setTimeout(connect, 2500);
+          }
+        };
+      } catch {
+        // Ignore WebSocket errors in restricted WebViews
+      }
     };
 
     connect();
@@ -382,18 +397,32 @@ export default function App() {
             <p className="text-[13px] max-w-[320px]" style={{ color: 'var(--nz-text-muted)' }}>
               {bootError || 'Gagal memuat aplikasi. Periksa koneksi kamu.'}
             </p>
-            <button
-              type="button"
-              onClick={() => {
-                autoRetryCountRef.current = 0;
-                bootstrap();
-              }}
-              className="mt-1 h-9 px-4 rounded-full text-[12.5px] font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90"
-              style={{ background: 'var(--nz-btn-bg)', color: 'var(--nz-btn-text)' }}
-            >
-              <RefreshCw className="w-3.5 h-3.5" strokeWidth={1.75} />
-              <span>Coba Lagi</span>
-            </button>
+            <div className="mt-1 flex items-center justify-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => {
+                  autoRetryCountRef.current = 0;
+                  bootstrap();
+                }}
+                className="h-9 px-4 rounded-full text-[12.5px] font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90"
+                style={{ background: 'var(--nz-btn-bg)', color: 'var(--nz-btn-text)' }}
+              >
+                <RefreshCw className="w-3.5 h-3.5" strokeWidth={1.75} />
+                <span>Coba Lagi</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="h-9 px-4 rounded-full text-[12.5px] font-semibold inline-flex items-center justify-center gap-1.5 border hover:opacity-90"
+                style={{
+                  background: 'var(--nz-elevated)',
+                  borderColor: 'var(--nz-border)',
+                  color: 'var(--nz-text)',
+                }}
+              >
+                <span>Muat Ulang Halaman</span>
+              </button>
+            </div>
           </div>
         </div>
       </>

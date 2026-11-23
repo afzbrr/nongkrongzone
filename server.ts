@@ -65,11 +65,18 @@ const schemaCaps = {
   storiesSongTitle: true,
 };
 
+let schemaCapsPromise: Promise<typeof schemaCaps> | null = null;
+
 async function detectSchemaCaps(sb: SupabaseClient) {
   if (schemaCaps.checked) return schemaCaps;
-  try {
-    const colProbe = (table: string, col: string) =>
-      sb.from(table).select(col).limit(1).then((r) => !r.error, () => false);
+  if (schemaCapsPromise) return schemaCapsPromise;
+  schemaCapsPromise = (async () => {
+    try {
+      const colProbe = (table: string, col: string) =>
+        Promise.race([
+          sb.from(table).select(col).limit(1).then((r) => !r.error, () => false),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 4000)),
+        ]);
 
     const [
       hasTgAv,
@@ -192,12 +199,14 @@ async function detectSchemaCaps(sb: SupabaseClient) {
     schemaCaps.storiesDurationHours = sDur;
     schemaCaps.storiesIsDeleted = sIsDel;
     schemaCaps.storiesSongTitle = sSong;
-  } catch {
-    // keep defaults
-  } finally {
-    schemaCaps.checked = true;
-  }
-  return schemaCaps;
+    } catch {
+      // keep defaults
+    } finally {
+      schemaCaps.checked = true;
+    }
+    return schemaCaps;
+  })();
+  return schemaCapsPromise;
 }
 
 function isOwnerByTelegramId(telegramId: unknown): boolean {
@@ -586,7 +595,14 @@ async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '75mb' }));
+  app.use((err: any, _req: Request, res: Response, next: (e?: any) => void) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      return res.status(400).json({ error: 'Format JSON tidak valid' });
+    }
+    return next(err);
+  });
 
   // Serve uploaded files safely with path traversal confinement
   app.get('/uploads/:filename', (req: Request, res: Response) => {
@@ -919,8 +935,186 @@ async function startServer() {
     }
   });
 
-  // Telegram Mini App Login: lookup/create by telegram_id, auto-sync username from Telegram, keep full_name/avatar/bio on existing users
+  async function handleTelegramLogin(
+    sb: SupabaseClient,
+    initData: string,
+    rawUserInput: any
+  ): Promise<{ status: number; body: Record<string, any> }> {
+    const caps = await detectSchemaCaps(sb);
+    const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
+    const hasValidBotToken = /^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken);
+    let tgUser = rawUserInput || (initData ? parseTelegramUserFromInitData(initData) : undefined);
+
+    if (hasValidBotToken && initData) {
+      const verified = verifyTelegramInitData(initData, rawBotToken);
+      if (verified.ok) {
+        if (verified.user) tgUser = verified.user;
+      } else {
+        console.warn('[TG AUTH] initData HMAC mismatch — periksa TELEGRAM_BOT_TOKEN di Secrets');
+        if (process.env.TELEGRAM_STRICT_AUTH === 'true') {
+          return { status: 401, body: { error: 'Verifikasi Telegram initData gagal' } };
+        }
+        if (verified.user) tgUser = verified.user;
+      }
+    } else if (initData && !tgUser?.id) {
+      tgUser = parseTelegramUserFromInitData(initData);
+    }
+
+    const tgId = Number(tgUser?.id);
+    if (!Number.isSafeInteger(tgId) || tgId <= 0) {
+      return { status: 400, body: { error: 'Data Telegram user tidak valid' } };
+    }
+
+    const isOwner = isOwnerByTelegramId(tgId);
+    const rawTgUsername =
+      typeof tgUser?.username === 'string'
+        ? tgUser.username.replace(/^@/, '').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 32)
+        : '';
+    const resolvedUsername = rawTgUsername || `tg_${tgId}`;
+
+    const firstName = typeof tgUser?.first_name === 'string' ? tgUser.first_name.trim() : '';
+    const lastName = typeof tgUser?.last_name === 'string' ? tgUser.last_name.trim() : '';
+    const combinedName = [firstName, lastName].filter(Boolean).join(' ').trim().slice(0, 20);
+    const tgFullName = combinedName || resolvedUsername.slice(0, 20);
+    const tgPhotoUrl = sanitizeUrl(tgUser?.photo_url);
+
+    const { data: existing, error: selErr } = await sb
+      .from('players')
+      .select('*')
+      .eq('telegram_id', tgId)
+      .maybeSingle();
+    if (selErr) throw selErr;
+
+    let activeRow = existing;
+
+    if (!existing) {
+      let finalUsername = resolvedUsername;
+      const { data: collider } = await sb
+        .from('players')
+        .select('id, telegram_id, username')
+        .eq('username', resolvedUsername)
+        .maybeSingle();
+      if (collider) {
+        if (isOwner) {
+          await sb
+            .from('players')
+            .update({ username: `${collider.username}_${String(collider.id).slice(0, 4)}` })
+            .eq('id', collider.id);
+        } else {
+          finalUsername = `${resolvedUsername.slice(0, 24)}_${String(tgId).slice(-4)}`;
+        }
+      }
+
+      const newPayload: Record<string, any> = {
+        telegram_id: tgId,
+        username: finalUsername,
+        name: tgFullName,
+        avatar_url: tgPhotoUrl,
+        bio: '',
+        is_owner: isOwner,
+        is_banned: false,
+        coins: isOwner ? OWNER_COINS : 0,
+        border_id: isOwner ? OWNER_BORDER : null,
+      };
+      if (caps.hasTelegramAvatarCol) {
+        newPayload.telegram_avatar_url = tgPhotoUrl;
+      }
+
+      const { data: inserted, error: insErr } = await sb
+        .from('players')
+        .insert(newPayload)
+        .select('*')
+        .single();
+      if (insErr) {
+        const { data: raceRow } = await sb
+          .from('players')
+          .select('*')
+          .eq('telegram_id', tgId)
+          .maybeSingle();
+        if (raceRow) {
+          activeRow = raceRow;
+        } else {
+          throw insErr;
+        }
+      } else {
+        activeRow = inserted;
+      }
+    } else {
+      // Existing user: DO NOT overwrite full_name, avatar_url, or bio!
+      // ONLY sync username automatically if changed in Telegram, plus telegram_avatar_url backup and owner flag by telegram_id.
+      const updates: Record<string, any> = {};
+
+      if (rawTgUsername && rawTgUsername !== existing.username) {
+        const { data: collider } = await sb
+          .from('players')
+          .select('id, username')
+          .eq('username', rawTgUsername)
+          .neq('id', existing.id)
+          .maybeSingle();
+        if (collider) {
+          if (isOwner) {
+            await sb
+              .from('players')
+              .update({ username: `${collider.username}_${String(collider.id).slice(0, 4)}` })
+              .eq('id', collider.id);
+            updates.username = rawTgUsername;
+          }
+        } else {
+          updates.username = rawTgUsername;
+        }
+      }
+
+      if (tgPhotoUrl && caps.hasTelegramAvatarCol && existing.telegram_avatar_url !== tgPhotoUrl) {
+        updates.telegram_avatar_url = tgPhotoUrl;
+      }
+      if (isOwner && (!existing.is_owner || Number(existing.coins) !== OWNER_COINS)) {
+        updates.is_owner = true;
+        updates.coins = OWNER_COINS;
+      } else if (!isOwner && existing.is_owner) {
+        updates.is_owner = false;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        const { data: updated, error: updErr } = await sb
+          .from('players')
+          .update(updates)
+          .eq('id', existing.id)
+          .select('*')
+          .single();
+        if (updErr) throw updErr;
+        activeRow = updated;
+      }
+    }
+
+    if (tgPhotoUrl && activeRow?.id) {
+      telegramAvatarMemoryCache.set(String(activeRow.id), tgPhotoUrl);
+    }
+
+    const normalizedRow = normalizePlayer(activeRow);
+    await syncProfilesTable(sb, normalizedRow);
+
+    const enriched = await enrichPlayerStats(sb, normalizedRow, normalizedRow.id);
+    const { data: allPlayers } = await sb
+      .from('players')
+      .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
+      .eq('is_banned', false)
+      .order('is_owner', { ascending: false })
+      .order('created_at', { ascending: true })
+      .limit(50);
+
+    return {
+      status: 200,
+      body: {
+        player: enriched,
+        sessionToken: signSessionToken(normalizedRow.id),
+        players: (allPlayers || []).map((p) => normalizePlayer(p)),
+      },
+    };
+  }
+
+  // Telegram Mini App Login (POST primary + GET fallback for strict WebView proxies)
   app.post('/api/auth/telegram', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     const sb = getSupabase();
     if (!sb) {
       return res.status(503).json({
@@ -929,175 +1123,38 @@ async function startServer() {
       });
     }
     try {
-      const caps = await detectSchemaCaps(sb);
-      const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
-      const hasValidBotToken = /^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken);
       const initData = typeof req.body?.initData === 'string' ? req.body.initData : '';
-      let tgUser = req.body?.user || (initData ? parseTelegramUserFromInitData(initData) : undefined);
+      const result = await handleTelegramLogin(sb, initData, req.body?.user);
+      return res.status(result.status).json(result.body);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal login Telegram' });
+    }
+  });
 
-      if (hasValidBotToken && initData) {
-        const verified = verifyTelegramInitData(initData, rawBotToken);
-        if (verified.ok) {
-          if (verified.user) tgUser = verified.user;
-        } else {
-          console.warn('[TG AUTH] initData HMAC mismatch — periksa TELEGRAM_BOT_TOKEN di Secrets');
-          if (process.env.TELEGRAM_STRICT_AUTH === 'true') {
-            return res.status(401).json({ error: 'Verifikasi Telegram initData gagal' });
-          }
-          if (verified.user) tgUser = verified.user;
-        }
-      } else if (initData && !tgUser?.id) {
-        tgUser = parseTelegramUserFromInitData(initData);
-      }
-
-      const tgId = Number(tgUser?.id);
-      if (!Number.isSafeInteger(tgId) || tgId <= 0) {
-        return res.status(400).json({ error: 'Data Telegram user tidak valid' });
-      }
-
-      const isOwner = isOwnerByTelegramId(tgId);
-      const rawTgUsername =
-        typeof tgUser?.username === 'string'
-          ? tgUser.username.replace(/^@/, '').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 32)
-          : '';
-      const resolvedUsername = rawTgUsername || `tg_${tgId}`;
-
-      const firstName = typeof tgUser?.first_name === 'string' ? tgUser.first_name.trim() : '';
-      const lastName = typeof tgUser?.last_name === 'string' ? tgUser.last_name.trim() : '';
-      const combinedName = [firstName, lastName].filter(Boolean).join(' ').trim().slice(0, 20);
-      const tgFullName = combinedName || resolvedUsername.slice(0, 20);
-      const tgPhotoUrl = sanitizeUrl(tgUser?.photo_url);
-
-      const { data: existing, error: selErr } = await sb
-        .from('players')
-        .select('*')
-        .eq('telegram_id', tgId)
-        .maybeSingle();
-      if (selErr) throw selErr;
-
-      let activeRow = existing;
-
-      if (!existing) {
-        // Check if resolvedUsername already collides with another account
-        let finalUsername = resolvedUsername;
-        const { data: collider } = await sb
-          .from('players')
-          .select('id, telegram_id, username')
-          .eq('username', resolvedUsername)
-          .maybeSingle();
-        if (collider) {
-          if (isOwner) {
-            await sb
-              .from('players')
-              .update({ username: `${collider.username}_${String(collider.id).slice(0, 4)}` })
-              .eq('id', collider.id);
-          } else {
-            finalUsername = `${resolvedUsername.slice(0, 24)}_${String(tgId).slice(-4)}`;
-          }
-        }
-
-        const newPayload: Record<string, any> = {
-          telegram_id: tgId,
-          username: finalUsername,
-          name: tgFullName,
-          avatar_url: tgPhotoUrl,
-          bio: '',
-          is_owner: isOwner,
-          is_banned: false,
-          coins: isOwner ? OWNER_COINS : 0,
-          border_id: isOwner ? OWNER_BORDER : null,
-        };
-        if (caps.hasTelegramAvatarCol) {
-          newPayload.telegram_avatar_url = tgPhotoUrl;
-        }
-
-        const { data: inserted, error: insErr } = await sb
-          .from('players')
-          .insert(newPayload)
-          .select('*')
-          .single();
-        if (insErr) {
-          const { data: raceRow } = await sb
-            .from('players')
-            .select('*')
-            .eq('telegram_id', tgId)
-            .maybeSingle();
-          if (raceRow) {
-            activeRow = raceRow;
-          } else {
-            throw insErr;
-          }
-        } else {
-          activeRow = inserted;
-        }
-      } else {
-        // Existing user: DO NOT overwrite full_name, avatar_url, or bio!
-        // ONLY sync username automatically if changed in Telegram, plus telegram_avatar_url backup and owner flag by telegram_id.
-        const updates: Record<string, any> = {};
-
-        if (rawTgUsername && rawTgUsername !== existing.username) {
-          const { data: collider } = await sb
-            .from('players')
-            .select('id, username')
-            .eq('username', rawTgUsername)
-            .neq('id', existing.id)
-            .maybeSingle();
-          if (collider) {
-            if (isOwner) {
-              await sb
-                .from('players')
-                .update({ username: `${collider.username}_${String(collider.id).slice(0, 4)}` })
-                .eq('id', collider.id);
-              updates.username = rawTgUsername;
-            }
-          } else {
-            updates.username = rawTgUsername;
-          }
-        }
-
-        if (tgPhotoUrl && caps.hasTelegramAvatarCol && existing.telegram_avatar_url !== tgPhotoUrl) {
-          updates.telegram_avatar_url = tgPhotoUrl;
-        }
-        if (isOwner && (!existing.is_owner || Number(existing.coins) !== OWNER_COINS)) {
-          updates.is_owner = true;
-          updates.coins = OWNER_COINS;
-        } else if (!isOwner && existing.is_owner) {
-          updates.is_owner = false;
-        }
-
-        if (Object.keys(updates).length > 0) {
-          const { data: updated, error: updErr } = await sb
-            .from('players')
-            .update(updates)
-            .eq('id', existing.id)
-            .select('*')
-            .single();
-          if (updErr) throw updErr;
-          activeRow = updated;
-        }
-      }
-
-      if (tgPhotoUrl && activeRow?.id) {
-        telegramAvatarMemoryCache.set(String(activeRow.id), tgPhotoUrl);
-      }
-
-      const normalizedRow = normalizePlayer(activeRow);
-      await syncProfilesTable(sb, normalizedRow);
-
-      const enriched = await enrichPlayerStats(sb, normalizedRow, normalizedRow.id);
-      const { data: allPlayers } = await sb
-        .from('players')
-        .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
-        .eq('is_banned', false)
-        .order('is_owner', { ascending: false })
-        .order('created_at', { ascending: true })
-        .limit(50);
-
-      return res.json({
-        player: enriched,
-        sessionToken: signSessionToken(normalizedRow.id),
-        players: (allPlayers || []).map((p) => normalizePlayer(p)),
+  app.get('/api/auth/telegram-login', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const sb = getSupabase();
+    if (!sb) {
+      return res.status(503).json({
+        error: 'SUPABASE_NOT_CONFIGURED',
+        message: 'Tambahkan SUPABASE_URL dan SUPABASE_ANON_KEY di Settings -> Secrets.',
       });
+    }
+    try {
+      const initData = typeof req.query.initData === 'string' ? req.query.initData : '';
+      const rawTgId = Number(req.query.tg_id);
+      const queryUser =
+        Number.isSafeInteger(rawTgId) && rawTgId > 0
+          ? {
+              id: rawTgId,
+              username: typeof req.query.username === 'string' ? req.query.username : undefined,
+              first_name: typeof req.query.first_name === 'string' ? req.query.first_name : undefined,
+              last_name: typeof req.query.last_name === 'string' ? req.query.last_name : undefined,
+              photo_url: typeof req.query.photo_url === 'string' ? req.query.photo_url : undefined,
+            }
+          : undefined;
+      const result = await handleTelegramLogin(sb, initData, queryUser);
+      return res.status(result.status).json(result.body);
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal login Telegram' });
     }
@@ -1105,6 +1162,7 @@ async function startServer() {
 
   // Auth / Me (auto-loads active session or Owner fallback in browser preview)
   app.get('/api/auth/me', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     const sb = getSupabase();
     if (!sb) {
       return res.status(503).json({
