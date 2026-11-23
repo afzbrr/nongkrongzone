@@ -45,7 +45,7 @@ const FlameSparkSvg: React.FC<{ className?: string }> = ({ className = 'w-4 h-5'
 export const SplashScreen: React.FC<SplashScreenProps> = ({ fadingOut }) => {
   return (
     <div
-      className={`fixed inset-0 z-[100] flex items-center justify-center overflow-hidden transition-opacity duration-500 ${
+      className={`fixed inset-0 z-[100] flex items-center justify-center overflow-hidden transition-opacity duration-300 ${
         fadingOut ? 'opacity-0 pointer-events-none' : 'opacity-100'
       }`}
       style={{

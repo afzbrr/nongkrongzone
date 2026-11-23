@@ -88,16 +88,22 @@ async function apiFetch<T>(
     const looksLikeHtml = contentType.includes('text/html') || /^\s*</.test(rawText);
 
     if (looksLikeHtml) {
+      const isSpaFallbackHtml =
+        rawText.includes('id="root"') || rawText.includes('NONGKRONG ZONE');
       const htmlErr = new Error(
-        'Server sedang menyiapkan koneksi. Coba lagi sebentar.'
+        isSpaFallbackHtml
+          ? 'SPA_STATIC_HOST'
+          : 'Server sedang menyiapkan koneksi. Coba lagi sebentar.'
       ) as Error & {
         status?: number;
         isProxyHtml?: boolean;
+        isSpaFallbackHtml?: boolean;
         isRetryable?: boolean;
       };
       htmlErr.status = res.status;
       htmlErr.isProxyHtml = true;
-      htmlErr.isRetryable = true;
+      htmlErr.isSpaFallbackHtml = isSpaFallbackHtml;
+      htmlErr.isRetryable = !isSpaFallbackHtml;
       throw htmlErr;
     }
 

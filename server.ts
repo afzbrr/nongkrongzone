@@ -66,6 +66,37 @@ const schemaCaps = {
 };
 
 let schemaCapsPromise: Promise<typeof schemaCaps> | null = null;
+let authCapsChecked = false;
+let authCapsPromise: Promise<void> | null = null;
+
+async function detectAuthSchemaCaps(sb: SupabaseClient) {
+  if (schemaCaps.checked || authCapsChecked) return schemaCaps;
+  if (authCapsPromise) {
+    await authCapsPromise;
+    return schemaCaps;
+  }
+  authCapsPromise = (async () => {
+    try {
+      const quickProbe = (table: string, col: string) =>
+        Promise.race([
+          sb.from(table).select(col).limit(1).then((r) => !r.error, () => false),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1500)),
+        ]);
+      const [hasTgAv, hasProf] = await Promise.all([
+        quickProbe('players', 'telegram_avatar_url'),
+        quickProbe('profiles', 'id'),
+      ]);
+      schemaCaps.hasTelegramAvatarCol = hasTgAv;
+      schemaCaps.hasProfilesTable = hasProf;
+    } catch {
+      // keep defaults
+    } finally {
+      authCapsChecked = true;
+    }
+  })();
+  await authCapsPromise;
+  return schemaCaps;
+}
 
 async function detectSchemaCaps(sb: SupabaseClient) {
   if (schemaCaps.checked) return schemaCaps;
@@ -235,7 +266,7 @@ function normalizePlayer(row: any): any {
 }
 
 async function syncProfilesTable(sb: SupabaseClient, playerRow: any) {
-  const caps = await detectSchemaCaps(sb);
+  const caps = await detectAuthSchemaCaps(sb);
   if (!caps.hasProfilesTable || !playerRow) return;
   try {
     const norm = normalizePlayer(playerRow);
@@ -940,7 +971,7 @@ async function startServer() {
     initData: string,
     rawUserInput: any
   ): Promise<{ status: number; body: Record<string, any> }> {
-    const caps = await detectSchemaCaps(sb);
+    const caps = await detectAuthSchemaCaps(sb);
     const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
     const hasValidBotToken = /^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken);
     let tgUser = rawUserInput || (initData ? parseTelegramUserFromInitData(initData) : undefined);
@@ -3141,8 +3172,11 @@ async function startServer() {
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
+        return next();
+      }
+      return res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
     const vite = await createViteServer({
