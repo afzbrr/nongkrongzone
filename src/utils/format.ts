@@ -59,6 +59,9 @@ export function sanitizeMediaUrl(url?: string | null): string | null {
   const trimmed = url.trim();
   if (trimmed.startsWith('/uploads/')) return trimmed;
   if (trimmed.startsWith('/src/assets/')) return trimmed;
+  if (/^data:(image\/(png|jpe?g|webp|gif|heic)|video\/(mp4|webm|quicktime|x-m4v));base64,[A-Za-z0-9+/=]+$/i.test(trimmed)) {
+    return trimmed;
+  }
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {

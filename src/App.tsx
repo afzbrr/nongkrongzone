@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import type { NotificationItem, Player, Post, StoryGroup } from './types';
-import { api, setActivePlayerId, setActiveSessionToken } from './services/api';
+import { api, isStaticSpaHost, setActivePlayerId, setActiveSessionToken } from './services/api';
 import { BordersProvider } from './context/BordersContext';
 import { StoryBar } from './components/StoryBar';
 import { StoryViewer } from './components/StoryViewer';
@@ -157,7 +157,7 @@ export default function App() {
       : 'Faiz Ganteng';
 
     return {
-      id: hasTg ? `tg-${tgId}` : '00000000-0000-0000-0000-000000000001',
+      id: isOwner ? '7c9a08e0-e0b1-42d1-ab74-cd87a431107b' : hasTg ? `tg-${tgId}` : '00000000-0000-0000-0000-000000000001',
       telegram_id: hasTg ? tgId : 6189849073,
       name: fullName,
       full_name: fullName,
@@ -168,7 +168,7 @@ export default function App() {
       is_owner: isOwner,
       is_banned: false,
       coins: isOwner ? 999999999 : 0,
-      border_id: isOwner ? 'FAIZ_OWNER' : null,
+      border_id: isOwner ? 'API_PHOENIX' : null,
       created_at: new Date().toISOString(),
     };
   }, []);
@@ -326,7 +326,7 @@ export default function App() {
 
   // WebSocket real-time connection
   useEffect(() => {
-    if (!currentUser?.id) return;
+    if (!currentUser?.id || isStaticSpaHost()) return;
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
