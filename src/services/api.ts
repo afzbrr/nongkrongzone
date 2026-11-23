@@ -36,7 +36,11 @@ export interface TelegramWebAppUser {
   photo_url?: string;
 }
 
-async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
+async function apiFetch<T>(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 15000
+): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> | undefined),
@@ -48,7 +52,25 @@ async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
     headers['x-player-id'] = activePlayerIdMemory;
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...options, headers, signal: controller.signal });
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err?.name === 'AbortError') {
+      throw new Error('Koneksi timeout. Periksa jaringan lalu coba lagi.');
+    }
+    throw new Error(err?.message || 'Gagal terhubung ke server');
+  }
+  clearTimeout(timer);
+
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('text/html')) {
+    throw new Error('Server sedang menyiapkan koneksi. Coba lagi sebentar.');
+  }
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data?.message || data?.error || 'Permintaan gagal') as Error & {
@@ -69,14 +91,18 @@ export async function uploadMediaFile(file: File): Promise<{ url: string; mediaT
     reader.onerror = () => reject(new Error('Gagal membaca file'));
     reader.readAsDataURL(file);
   });
-  return apiFetch<{ url: string; mediaType: string }>('/api/upload', {
-    method: 'POST',
-    body: JSON.stringify({
-      filename: file.name,
-      mimeType: file.type,
-      dataBase64,
-    }),
-  });
+  return apiFetch<{ url: string; mediaType: string }>(
+    '/api/upload',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        filename: file.name,
+        mimeType: file.type,
+        dataBase64,
+      }),
+    },
+    60000
+  );
 }
 
 export const api = {

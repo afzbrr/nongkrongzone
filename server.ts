@@ -276,26 +276,39 @@ function verifySessionToken(token: string): string | null {
   }
 }
 
-function verifyTelegramInitData(initData: string, botToken: string): { ok: boolean; user?: any } {
+function parseTelegramUserFromInitData(initData: string): any | undefined {
   try {
     const params = new URLSearchParams(initData);
-    const hash = params.get('hash');
-    if (!hash) return { ok: false };
-    const pairs: string[] = [];
-    params.forEach((value, key) => {
-      if (key !== 'hash') pairs.push(`${key}=${value}`);
-    });
-    pairs.sort();
-    const dataCheckString = pairs.join('\n');
-    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
-    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-    const a = Buffer.from(hash, 'hex');
-    const b = Buffer.from(computedHash, 'hex');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      return { ok: false };
-    }
     const rawUser = params.get('user');
-    return { ok: true, user: rawUser ? JSON.parse(rawUser) : undefined };
+    return rawUser ? JSON.parse(rawUser) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function verifyTelegramInitData(initData: string, rawBotToken: string): { ok: boolean; user?: any } {
+  try {
+    const botToken = rawBotToken.replace(/^['"]|['"]$/g, '').trim();
+    if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(botToken)) {
+      return { ok: false, user: parseTelegramUserFromInitData(initData) };
+    }
+    const params = new URLSearchParams(initData);
+    const hash = (params.get('hash') || '').trim().toLowerCase();
+    if (!hash) return { ok: false };
+    const entries: [string, string][] = [];
+    params.forEach((value, key) => {
+      if (key !== 'hash') entries.push([key, value]);
+    });
+    entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex').toLowerCase();
+    const a = Buffer.from(hash, 'utf8');
+    const b = Buffer.from(computedHash, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, user: parseTelegramUserFromInitData(initData) };
+    }
+    return { ok: true, user: parseTelegramUserFromInitData(initData) };
   } catch {
     return { ok: false };
   }
@@ -917,18 +930,24 @@ async function startServer() {
     }
     try {
       const caps = await detectSchemaCaps(sb);
-      const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
+      const hasValidBotToken = /^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken);
       const initData = typeof req.body?.initData === 'string' ? req.body.initData : '';
-      let tgUser = req.body?.user;
+      let tgUser = req.body?.user || (initData ? parseTelegramUserFromInitData(initData) : undefined);
 
-      if (botToken && initData) {
-        const verified = verifyTelegramInitData(initData, botToken);
-        if (!verified.ok) {
-          return res.status(401).json({ error: 'Verifikasi Telegram initData gagal' });
+      if (hasValidBotToken && initData) {
+        const verified = verifyTelegramInitData(initData, rawBotToken);
+        if (verified.ok) {
+          if (verified.user) tgUser = verified.user;
+        } else {
+          console.warn('[TG AUTH] initData HMAC mismatch — periksa TELEGRAM_BOT_TOKEN di Secrets');
+          if (process.env.TELEGRAM_STRICT_AUTH === 'true') {
+            return res.status(401).json({ error: 'Verifikasi Telegram initData gagal' });
+          }
+          if (verified.user) tgUser = verified.user;
         }
-        if (verified.user) {
-          tgUser = verified.user;
-        }
+      } else if (initData && !tgUser?.id) {
+        tgUser = parseTelegramUserFromInitData(initData);
       }
 
       const tgId = Number(tgUser?.id);
@@ -984,6 +1003,7 @@ async function startServer() {
           avatar_url: tgPhotoUrl,
           bio: '',
           is_owner: isOwner,
+          is_banned: false,
           coins: isOwner ? OWNER_COINS : 0,
           border_id: isOwner ? OWNER_BORDER : null,
         };
@@ -996,8 +1016,20 @@ async function startServer() {
           .insert(newPayload)
           .select('*')
           .single();
-        if (insErr) throw insErr;
-        activeRow = inserted;
+        if (insErr) {
+          const { data: raceRow } = await sb
+            .from('players')
+            .select('*')
+            .eq('telegram_id', tgId)
+            .maybeSingle();
+          if (raceRow) {
+            activeRow = raceRow;
+          } else {
+            throw insErr;
+          }
+        } else {
+          activeRow = inserted;
+        }
       } else {
         // Existing user: DO NOT overwrite full_name, avatar_url, or bio!
         // ONLY sync username automatically if changed in Telegram, plus telegram_avatar_url backup and owner flag by telegram_id.

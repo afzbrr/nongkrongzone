@@ -98,9 +98,49 @@ export default function App() {
     }
   }, []);
 
+  const [slowLoading, setSlowLoading] = useState(false);
+  const autoRetryCountRef = useRef(0);
+
+  const extractTelegramAuth = useCallback(() => {
+    const tgWebApp = (window as any)?.Telegram?.WebApp;
+    try {
+      tgWebApp?.ready?.();
+      tgWebApp?.expand?.();
+    } catch {
+      // ignore WebApp API errors
+    }
+
+    let initData = typeof tgWebApp?.initData === 'string' ? tgWebApp.initData : '';
+    let tgUser = tgWebApp?.initDataUnsafe?.user;
+
+    if (!initData && typeof window !== 'undefined') {
+      try {
+        const hashRaw = window.location.hash.replace(/^#/, '');
+        const hashParams = new URLSearchParams(hashRaw);
+        const fromHash = hashParams.get('tgWebAppData');
+        if (fromHash) initData = fromHash;
+      } catch {
+        // ignore hash parse errors
+      }
+    }
+
+    if ((!tgUser || !tgUser.id) && initData) {
+      try {
+        const params = new URLSearchParams(initData);
+        const rawUser = params.get('user');
+        if (rawUser) tgUser = JSON.parse(rawUser);
+      } catch {
+        // ignore user JSON parse errors
+      }
+    }
+
+    return { initData, tgUser };
+  }, []);
+
   const bootstrap = useCallback(async () => {
     setBootState('loading');
     setBootError(null);
+    setSlowLoading(false);
     try {
       const health = await api.health();
       if (!health.supabaseConfigured) {
@@ -109,14 +149,11 @@ export default function App() {
         return;
       }
 
-      const tgWebApp = (window as any)?.Telegram?.WebApp;
-      tgWebApp?.ready?.();
-      tgWebApp?.expand?.();
-      const tgUser = tgWebApp?.initDataUnsafe?.user;
+      const { initData, tgUser } = extractTelegramAuth();
 
       const meRes = tgUser?.id
         ? await api.telegramLogin({
-            initData: typeof tgWebApp?.initData === 'string' ? tgWebApp.initData : '',
+            initData,
             user: {
               id: Number(tgUser.id),
               username: tgUser.username,
@@ -127,27 +164,37 @@ export default function App() {
           })
         : await api.getMe();
 
+      autoRetryCountRef.current = 0;
       setActivePlayerId(meRes.player.id);
       if (meRes.sessionToken) {
         setActiveSessionToken(meRes.sessionToken);
       }
       setCurrentUser(meRes.player);
-      setAllPlayers(meRes.players);
+      setAllPlayers(meRes.players || [meRes.player]);
       setBootState('ready');
-      await Promise.all([loadFeedAndStories(), loadNotificationsAndChats()]);
+
+      // Load feed & notifications in background so feed issues never trap user on loading screen
+      Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
     } catch (err: any) {
       if (err?.code === 'SUPABASE_NOT_CONFIGURED') {
         setMissingEnv(['SUPABASE_URL', 'SUPABASE_ANON_KEY']);
         setBootState('unconfigured');
       } else {
-        setBootError(err?.message || null);
+        setBootError(err?.message || 'Gagal terhubung ke server');
         setBootState('error');
       }
     }
-  }, [loadFeedAndStories, loadNotificationsAndChats]);
+  }, [extractTelegramAuth, loadFeedAndStories, loadNotificationsAndChats]);
 
   useEffect(() => {
     document.title = 'NONGKRONG ZONE - Tempat Nongkrong Anak Muda';
+    try {
+      const tgWebApp = (window as any)?.Telegram?.WebApp;
+      tgWebApp?.ready?.();
+      tgWebApp?.expand?.();
+    } catch {
+      // ignore
+    }
     const fadeTimer = setTimeout(() => {
       setSplashPhase('fading');
     }, 2400);
@@ -165,10 +212,18 @@ export default function App() {
   }, [bootstrap]);
 
   useEffect(() => {
+    if (bootState !== 'loading') return;
+    const t = setTimeout(() => setSlowLoading(true), 6000);
+    return () => clearTimeout(t);
+  }, [bootState]);
+
+  useEffect(() => {
     if (bootState !== 'error') return;
+    if (autoRetryCountRef.current >= 1) return;
     const timer = setTimeout(() => {
+      autoRetryCountRef.current += 1;
       bootstrap();
-    }, 2500);
+    }, 2000);
     return () => clearTimeout(timer);
   }, [bootState, bootstrap]);
 
@@ -313,20 +368,66 @@ export default function App() {
     }
   };
 
-  // LOADING OR AUTO-RETRYING STATE
-  if (bootState === 'loading' || bootState === 'error' || (bootState === 'ready' && !currentUser)) {
+  // LOADING OR ERROR STATE
+  if (bootState === 'error') {
     return (
       <>
         {splashPhase !== 'done' && <SplashScreen fadingOut={splashPhase === 'fading'} />}
         <div className="min-h-dvh flex justify-center" style={{ background: 'var(--nz-bg)', color: 'var(--nz-text)' }}>
           <div
-            className="w-full max-w-[480px] min-h-dvh sm:border-x flex flex-col items-center justify-center gap-3"
+            className="w-full max-w-[480px] min-h-dvh sm:border-x flex flex-col items-center justify-center gap-3 px-6 text-center"
+            style={{ borderColor: 'var(--nz-border)' }}
+          >
+            <BrandLogo size="md" />
+            <p className="text-[13px] max-w-[320px]" style={{ color: 'var(--nz-text-muted)' }}>
+              {bootError || 'Gagal memuat aplikasi. Periksa koneksi kamu.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                autoRetryCountRef.current = 0;
+                bootstrap();
+              }}
+              className="mt-1 h-9 px-4 rounded-full text-[12.5px] font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90"
+              style={{ background: 'var(--nz-btn-bg)', color: 'var(--nz-btn-text)' }}
+            >
+              <RefreshCw className="w-3.5 h-3.5" strokeWidth={1.75} />
+              <span>Coba Lagi</span>
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  if (bootState === 'loading' || (bootState === 'ready' && !currentUser)) {
+    return (
+      <>
+        {splashPhase !== 'done' && <SplashScreen fadingOut={splashPhase === 'fading'} />}
+        <div className="min-h-dvh flex justify-center" style={{ background: 'var(--nz-bg)', color: 'var(--nz-text)' }}>
+          <div
+            className="w-full max-w-[480px] min-h-dvh sm:border-x flex flex-col items-center justify-center gap-3 px-6 text-center"
             style={{ borderColor: 'var(--nz-border)' }}
           >
             <BrandLogo size="md" />
             <span className="text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
               Memuat...
             </span>
+            {slowLoading && (
+              <button
+                type="button"
+                onClick={bootstrap}
+                className="mt-1 h-8 px-3.5 rounded-full text-[12px] font-semibold inline-flex items-center justify-center gap-1.5 border"
+                style={{
+                  background: 'var(--nz-elevated)',
+                  borderColor: 'var(--nz-border)',
+                  color: 'var(--nz-text)',
+                }}
+              >
+                <RefreshCw className="w-3 h-3" strokeWidth={1.75} />
+                <span>Muat Ulang</span>
+              </button>
+            )}
           </div>
         </div>
       </>
