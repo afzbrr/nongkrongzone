@@ -79,7 +79,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const dragStartYRef = useRef<number | null>(null);
 
   const loadProfileData = async () => {
-    setLoading(true);
+    const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
+    if (isOwnByUsername && !profile) {
+      setProfile(currentUser);
+      setLoading(false);
+    } else if (!profile) {
+      setLoading(true);
+    }
     try {
       const pRes = await api.getPlayerProfile(username);
       setProfile(pRes.player);
@@ -90,7 +96,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         setPosts([]);
       }
     } catch {
-      setProfile(null);
+      if (isOwnByUsername) {
+        setProfile(currentUser);
+      } else {
+        setProfile(null);
+      }
       setPosts([]);
     } finally {
       setLoading(false);
@@ -99,7 +109,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   useEffect(() => {
     loadProfileData();
-  }, [username, currentUser.id]);
+  }, [username, currentUser.id, currentUser.username, currentUser.avatar_url, currentUser.name, currentUser.border_id]);
 
   const isMe = profile?.id === currentUser.id;
 

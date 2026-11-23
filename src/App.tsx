@@ -128,9 +128,15 @@ export default function App() {
 
     if ((!tgUser || !tgUser.id) && initData) {
       try {
-        const params = new URLSearchParams(initData);
+        const normalizedInit = initData.includes('%3D') && !initData.includes('=')
+          ? decodeURIComponent(initData)
+          : initData;
+        const params = new URLSearchParams(normalizedInit);
         const rawUser = params.get('user');
-        if (rawUser) tgUser = JSON.parse(rawUser);
+        if (rawUser) {
+          const decodedUser = rawUser.startsWith('%') ? decodeURIComponent(rawUser) : rawUser;
+          tgUser = JSON.parse(decodedUser);
+        }
       } catch {
         // ignore user JSON parse errors
       }

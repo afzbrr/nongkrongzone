@@ -359,6 +359,112 @@ if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
+const tgAvatarFetchCache = new Map<number, { ts: number; url: string | null }>();
+
+async function fetchTelegramAvatarFromBotApi(
+  sb: SupabaseClient,
+  tgId: number
+): Promise<string | null> {
+  if (!Number.isSafeInteger(tgId) || tgId <= 0) return null;
+  const cached = tgAvatarFetchCache.get(tgId);
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) {
+    return cached.url;
+  }
+
+  const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
+  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken)) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2800);
+  try {
+    const photosRes = await fetch(
+      `https://api.telegram.org/bot${rawBotToken}/getUserProfilePhotos?user_id=${tgId}&limit=1`,
+      { signal: controller.signal }
+    );
+    if (!photosRes.ok) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+    const photosData: any = await photosRes.json().catch(() => null);
+    const sizes = photosData?.result?.photos?.[0];
+    if (!Array.isArray(sizes) || sizes.length === 0) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+    const bestPhoto = sizes[sizes.length - 1];
+    const fileId = bestPhoto?.file_id;
+    if (typeof fileId !== 'string' || !fileId) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+
+    const fileRes = await fetch(
+      `https://api.telegram.org/bot${rawBotToken}/getFile?file_id=${encodeURIComponent(fileId)}`,
+      { signal: controller.signal }
+    );
+    if (!fileRes.ok) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+    const fileData: any = await fileRes.json().catch(() => null);
+    const filePath = fileData?.result?.file_path;
+    if (typeof filePath !== 'string' || !filePath || filePath.includes('..')) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+
+    const imgRes = await fetch(
+      `https://api.telegram.org/file/bot${rawBotToken}/${filePath.replace(/^\/+/, '')}`,
+      { signal: controller.signal }
+    );
+    if (!imgRes.ok) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+    const arrayBuf = await imgRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    if (buffer.byteLength === 0 || buffer.byteLength > 5 * 1024 * 1024) {
+      tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+      return null;
+    }
+
+    const filename = `tg_avatar_${tgId}.jpg`;
+    let publicUrl: string | null = null;
+    try {
+      const storagePath = `avatars/${filename}`;
+      const { error: upErr } = await sb.storage
+        .from('media')
+        .upload(storagePath, buffer, { contentType: 'image/jpeg', upsert: true });
+      if (!upErr) {
+        const { data: pubData } = sb.storage.from('media').getPublicUrl(storagePath);
+        if (pubData?.publicUrl) {
+          publicUrl = pubData.publicUrl;
+        }
+      }
+    } catch {
+      // fall back to local /uploads
+    }
+
+    if (!publicUrl) {
+      const targetPath = path.resolve(UPLOADS_DIR, filename);
+      if (targetPath.startsWith(UPLOADS_DIR + path.sep)) {
+        fs.writeFileSync(targetPath, buffer);
+        publicUrl = `/uploads/${filename}`;
+      }
+    }
+
+    tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: publicUrl });
+    return publicUrl;
+  } catch {
+    tgAvatarFetchCache.set(tgId, { ts: Date.now(), url: null });
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function getSupabaseConfig() {
   const url = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
   const key = (
@@ -483,7 +589,31 @@ async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
     .maybeSingle();
 
   if (selectErr) throw selectErr;
-  if (existingOwner) return normalizePlayer(existingOwner);
+  if (existingOwner) {
+    if (!existingOwner.avatar_url) {
+      const fetchedAv = await fetchTelegramAvatarFromBotApi(sb, OWNER_TELEGRAM_ID);
+      if (fetchedAv) {
+        const updatePayload: Record<string, any> = { avatar_url: fetchedAv };
+        const caps = await detectAuthSchemaCaps(sb);
+        if (caps.hasTelegramAvatarCol) {
+          updatePayload.telegram_avatar_url = fetchedAv;
+        }
+        const { data: updatedOwner } = await sb
+          .from('players')
+          .update(updatePayload)
+          .eq('id', existingOwner.id)
+          .select('*')
+          .maybeSingle();
+        if (updatedOwner) {
+          const norm = normalizePlayer(updatedOwner);
+          telegramAvatarMemoryCache.set(String(norm.id), fetchedAv);
+          await syncProfilesTable(sb, norm);
+          return norm;
+        }
+      }
+    }
+    return normalizePlayer(existingOwner);
+  }
 
   const ownerPayload = {
     telegram_id: OWNER_TELEGRAM_ID,
@@ -1007,7 +1137,7 @@ async function startServer() {
     const lastName = typeof tgUser?.last_name === 'string' ? tgUser.last_name.trim() : '';
     const combinedName = [firstName, lastName].filter(Boolean).join(' ').trim().slice(0, 20);
     const tgFullName = combinedName || resolvedUsername.slice(0, 20);
-    const tgPhotoUrl = sanitizeUrl(tgUser?.photo_url);
+    let tgPhotoUrl = sanitizeUrl(tgUser?.photo_url);
 
     const { data: existing, error: selErr } = await sb
       .from('players')
@@ -1015,6 +1145,26 @@ async function startServer() {
       .eq('telegram_id', tgId)
       .maybeSingle();
     if (selErr) throw selErr;
+
+    let profileRow: any = null;
+    if (caps.hasProfilesTable) {
+      const { data: pRow } = await sb
+        .from('profiles')
+        .select('*')
+        .eq('telegram_id', tgId)
+        .maybeSingle();
+      profileRow = pRow || null;
+    }
+
+    if (!tgPhotoUrl) {
+      tgPhotoUrl =
+        sanitizeUrl(profileRow?.telegram_avatar_url) ||
+        sanitizeUrl(profileRow?.avatar_url) ||
+        null;
+      if (!tgPhotoUrl && !existing?.avatar_url) {
+        tgPhotoUrl = await fetchTelegramAvatarFromBotApi(sb, tgId);
+      }
+    }
 
     let activeRow = existing;
 
@@ -1036,12 +1186,19 @@ async function startServer() {
         }
       }
 
+      const initialAvatar = sanitizeUrl(profileRow?.avatar_url) || tgPhotoUrl;
+      const initialName =
+        (typeof profileRow?.full_name === 'string' && profileRow.full_name.trim())
+          ? profileRow.full_name.trim().slice(0, 20)
+          : tgFullName;
+      const initialBio = typeof profileRow?.bio === 'string' ? profileRow.bio : '';
+
       const newPayload: Record<string, any> = {
         telegram_id: tgId,
         username: finalUsername,
-        name: tgFullName,
-        avatar_url: tgPhotoUrl,
-        bio: '',
+        name: initialName,
+        avatar_url: initialAvatar,
+        bio: initialBio,
         is_owner: isOwner,
         is_banned: false,
         coins: isOwner ? OWNER_COINS : 0,
@@ -1071,8 +1228,9 @@ async function startServer() {
         activeRow = inserted;
       }
     } else {
-      // Existing user: DO NOT overwrite full_name, avatar_url, or bio!
-      // ONLY sync username automatically if changed in Telegram, plus telegram_avatar_url backup and owner flag by telegram_id.
+      // Existing user: DO NOT overwrite custom full_name, custom avatar_url, or bio!
+      // ONLY sync username automatically if changed in Telegram, populate avatar_url if still empty,
+      // keep telegram_avatar_url updated, and enforce owner flag by telegram_id.
       const updates: Record<string, any> = {};
 
       if (rawTgUsername && rawTgUsername !== existing.username) {
@@ -1093,6 +1251,24 @@ async function startServer() {
         } else {
           updates.username = rawTgUsername;
         }
+      }
+
+      const hydratedAvatar =
+        tgPhotoUrl ||
+        sanitizeUrl(profileRow?.avatar_url) ||
+        sanitizeUrl(profileRow?.telegram_avatar_url);
+      if (!existing.avatar_url && hydratedAvatar) {
+        updates.avatar_url = hydratedAvatar;
+      }
+      if (!existing.bio && typeof profileRow?.bio === 'string' && profileRow.bio.trim()) {
+        updates.bio = profileRow.bio;
+      }
+      if (
+        (!existing.name || existing.name === 'Pengguna') &&
+        typeof profileRow?.full_name === 'string' &&
+        profileRow.full_name.trim()
+      ) {
+        updates.name = profileRow.full_name.trim().slice(0, 20);
       }
 
       if (tgPhotoUrl && caps.hasTelegramAvatarCol && existing.telegram_avatar_url !== tgPhotoUrl) {
