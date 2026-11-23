@@ -1,0 +1,304 @@
+import type {
+  BorderItem,
+  ChatGroup,
+  ConversationItem,
+  Message,
+  NotificationItem,
+  Player,
+  Post,
+  PostComment,
+  Story,
+  StoryGroup,
+  StoryReact,
+  StoryView,
+} from '../types';
+
+let activePlayerIdMemory: string | null = null;
+let activeSessionTokenMemory: string | null = null;
+
+export function setActivePlayerId(id: string | null) {
+  activePlayerIdMemory = id;
+}
+
+export function setActiveSessionToken(token: string | null) {
+  activeSessionTokenMemory = token;
+}
+
+export function getActivePlayerId(): string | null {
+  return activePlayerIdMemory;
+}
+
+export interface TelegramWebAppUser {
+  id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+  photo_url?: string;
+}
+
+async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string> | undefined),
+  };
+  if (activeSessionTokenMemory) {
+    headers['Authorization'] = `Bearer ${activeSessionTokenMemory}`;
+  }
+  if (activePlayerIdMemory) {
+    headers['x-player-id'] = activePlayerIdMemory;
+  }
+
+  const res = await fetch(url, { ...options, headers });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data?.message || data?.error || 'Permintaan gagal') as Error & {
+      code?: string;
+      status?: number;
+    };
+    err.code = data?.error;
+    err.status = res.status;
+    throw err;
+  }
+  return data as T;
+}
+
+export async function uploadMediaFile(file: File): Promise<{ url: string; mediaType: string }> {
+  const dataBase64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Gagal membaca file'));
+    reader.readAsDataURL(file);
+  });
+  return apiFetch<{ url: string; mediaType: string }>('/api/upload', {
+    method: 'POST',
+    body: JSON.stringify({
+      filename: file.name,
+      mimeType: file.type,
+      dataBase64,
+    }),
+  });
+}
+
+export const api = {
+  health: () =>
+    apiFetch<{ ok: boolean; supabaseConfigured: boolean; missing: string[] }>('/api/health'),
+
+  telegramLogin: (payload: { initData?: string; user: TelegramWebAppUser }) =>
+    apiFetch<{ player: Player; sessionToken: string; players: Player[] }>('/api/auth/telegram', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getMe: () => apiFetch<{ player: Player; sessionToken?: string; players: Player[] }>('/api/auth/me'),
+
+  updateMe: (payload: { full_name?: string; name?: string; bio?: string; avatar_url?: string | null }) =>
+    apiFetch<{ player: Player }>('/api/players/me', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        ...(payload.full_name !== undefined ? { full_name: payload.full_name } : {}),
+        ...(payload.name !== undefined ? { name: payload.name } : {}),
+        ...(payload.bio !== undefined ? { bio: payload.bio } : {}),
+        ...(payload.avatar_url !== undefined ? { avatar_url: payload.avatar_url } : {}),
+      }),
+    }),
+
+  getPlayers: (q = '') =>
+    apiFetch<{ players: Player[] }>(`/api/players${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+
+  getPlayerProfile: (identifier: string) =>
+    apiFetch<{ player: Player }>(`/api/players/${encodeURIComponent(identifier)}`),
+
+  getFollowers: (playerId: string) =>
+    apiFetch<{ players: Player[] }>(`/api/players/${playerId}/followers`),
+
+  getFollowing: (playerId: string) =>
+    apiFetch<{ players: Player[] }>(`/api/players/${playerId}/following`),
+
+  getBlockedPlayers: () => apiFetch<{ players: Player[] }>('/api/players/me/blocked'),
+
+  follow: (target_player_id: string) =>
+    apiFetch<{ ok: boolean }>('/api/follows', {
+      method: 'POST',
+      body: JSON.stringify({ target_player_id }),
+    }),
+
+  unfollow: (targetId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/follows/${targetId}`, { method: 'DELETE' }),
+
+  block: (target_player_id: string) =>
+    apiFetch<{ ok: boolean }>('/api/blocks', {
+      method: 'POST',
+      body: JSON.stringify({ target_player_id }),
+    }),
+
+  unblock: (targetId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/blocks/${targetId}`, { method: 'DELETE' }),
+
+  getPosts: (params?: { playerId?: string; q?: string }) => {
+    const sp = new URLSearchParams();
+    if (params?.playerId) sp.set('playerId', params.playerId);
+    if (params?.q) sp.set('q', params.q);
+    const qs = sp.toString();
+    return apiFetch<{ posts: Post[] }>(`/api/posts${qs ? `?${qs}` : ''}`);
+  },
+
+  getPost: (postId: string) => apiFetch<{ post: Post | null }>(`/api/posts/${postId}`),
+
+  createPost: (payload: {
+    caption?: string;
+    media_urls?: string[];
+    media_type?: string;
+    tagged_usernames?: string[];
+    original_post_id?: string | null;
+    repost_caption?: string | null;
+  }) =>
+    apiFetch<{ post: Post }>('/api/posts', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  deletePost: (postId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/posts/${postId}`, { method: 'DELETE' }),
+
+  togglePostLike: (postId: string) =>
+    apiFetch<{ liked: boolean; likes_count: number }>(`/api/posts/${postId}/like`, {
+      method: 'POST',
+    }),
+
+  getComments: (postId: string) =>
+    apiFetch<{ comments: PostComment[] }>(`/api/posts/${postId}/comments`),
+
+  addComment: (postId: string, text: string, parent_comment_id?: string | null) =>
+    apiFetch<{ comment: PostComment; comments_count: number }>(`/api/posts/${postId}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ text, parent_comment_id: parent_comment_id || null }),
+    }),
+
+  toggleCommentLike: (commentId: string) =>
+    apiFetch<{ liked: boolean; likes_count: number }>(`/api/comments/${commentId}/like`, {
+      method: 'POST',
+    }),
+
+  deleteComment: (commentId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/comments/${commentId}`, { method: 'DELETE' }),
+
+  getStories: () => apiFetch<{ storyGroups: StoryGroup[] }>('/api/stories'),
+
+  createStory: (payload: {
+    media_url?: string | null;
+    media_type: 'text' | 'image' | 'video';
+    text?: string;
+    caption?: string;
+    bg_color?: string;
+    duration_hours?: 1 | 6 | 12 | 24;
+    song_title?: string;
+    song_artist?: string;
+    song_url?: string;
+  }) =>
+    apiFetch<{ story: Story }>('/api/stories', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  deleteStory: (storyId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/stories/${storyId}`, { method: 'DELETE' }),
+
+  viewStory: (storyId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/stories/${storyId}/view`, { method: 'POST' }),
+
+  getStoryViews: (storyId: string) =>
+    apiFetch<{ viewers: StoryView[]; reacts: StoryReact[] }>(`/api/stories/${storyId}/views`),
+
+  reactStory: (storyId: string, emoji: string) =>
+    apiFetch<{ react: StoryReact }>(`/api/stories/${storyId}/react`, {
+      method: 'POST',
+      body: JSON.stringify({ emoji }),
+    }),
+
+  replyStory: (storyId: string, text: string) =>
+    apiFetch<{ message: Message; peer_id: string }>(`/api/stories/${storyId}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
+
+  getConversations: () =>
+    apiFetch<{ conversations: ConversationItem[] }>('/api/chat/conversations'),
+
+  getDmMessages: (peerId: string) =>
+    apiFetch<{ peer: Player; messages: Message[]; blocked: boolean }>(`/api/chat/dm/${peerId}`),
+
+  markDmRead: (peerId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/chat/dm/${peerId}/read`, { method: 'POST' }),
+
+  getGroupMessages: (groupId: string) =>
+    apiFetch<{ group: ChatGroup; messages: Message[] }>(`/api/chat/groups/${groupId}`),
+
+  createGroup: (payload: { name: string; avatar_url?: string | null; member_ids: string[] }) =>
+    apiFetch<{ group: ChatGroup }>('/api/chat/groups', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  addGroupMember: (groupId: string, player_id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/chat/groups/${groupId}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ player_id }),
+    }),
+
+  sendMessage: (payload: {
+    receiver_id?: string | null;
+    group_id?: string | null;
+    reply_to_id?: string | null;
+    text?: string | null;
+    media_url?: string | null;
+    media_type?: string | null;
+  }) =>
+    apiFetch<{ message: Message }>('/api/chat/messages', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  reactMessage: (messageId: string, emoji: string | null) =>
+    apiFetch<{ message: Message }>(`/api/chat/messages/${messageId}/react`, {
+      method: 'POST',
+      body: JSON.stringify({ emoji }),
+    }),
+
+  deleteMessage: (messageId: string, scope: 'me' | 'all') =>
+    apiFetch<{ ok: boolean; message?: Message; deletedForMeId?: string }>(
+      `/api/chat/messages/${messageId}?scope=${scope}`,
+      { method: 'DELETE' }
+    ),
+
+  getNotifications: () =>
+    apiFetch<{ notifications: NotificationItem[]; unreadCount: number }>('/api/notifications'),
+
+  markAllNotificationsRead: () =>
+    apiFetch<{ ok: boolean }>('/api/notifications/read-all', { method: 'POST' }),
+
+  markNotificationRead: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/notifications/${id}/read`, { method: 'POST' }),
+
+  getBorders: () =>
+    apiFetch<{
+      borders: BorderItem[];
+      collectionBorders?: BorderItem[];
+      ownedIds: string[];
+      equippedBorderId: string | null;
+      coins: number;
+      rawCount?: number;
+      rlsHint?: string | null;
+    }>('/api/borders'),
+
+  buyBorder: (border_id: string) =>
+    apiFetch<{ ok: boolean; coins: number; border: BorderItem }>('/api/borders/buy', {
+      method: 'POST',
+      body: JSON.stringify({ border_id }),
+    }),
+
+  equipBorder: (border_id: string) =>
+    apiFetch<{ ok: boolean; border_id: string; player: Player }>('/api/borders/equip', {
+      method: 'POST',
+      body: JSON.stringify({ border_id }),
+    }),
+};
