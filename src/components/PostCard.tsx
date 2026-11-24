@@ -47,6 +47,14 @@ export const PostCard: React.FC<PostCardProps> = ({
   const canDelete = isMine || Boolean(currentUser.is_owner);
   const isRepost = Boolean(post.original_post_id);
   const orig = post.original_post;
+  const isPureRepost = Boolean(isRepost && !post.repost_caption && orig);
+  const displayAuthor = isPureRepost ? orig?.player || author : author;
+  const isSelfRepost = Boolean(
+    isRepost &&
+      orig &&
+      (orig.player_id === post.player_id ||
+        (orig.player?.username && author?.username && orig.player.username === author.username))
+  );
 
   const handleRepostSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -73,43 +81,67 @@ export const PostCard: React.FC<PostCardProps> = ({
           style={{ color: 'var(--nz-text-muted)' }}
         >
           <Repeat2 className="w-3.5 h-3.5" strokeWidth={1.5} />
-          <span>
-            Merepost dari{' '}
-            {orig?.player ? (
-              <button
-                type="button"
-                onClick={() => onOpenProfile(orig.player!.username)}
-                className="font-medium hover:underline"
-                style={{ color: 'var(--nz-accent-text)' }}
-              >
-                @{orig.player.username}
-              </button>
-            ) : (
-              'pengguna'
-            )}
-          </span>
+          {isPureRepost ? (
+            <span>
+              Direpost oleh{' '}
+              {author ? (
+                <button
+                  type="button"
+                  onClick={() => onOpenProfile(author.username)}
+                  className="font-medium hover:underline"
+                  style={{ color: 'var(--nz-accent-text)' }}
+                >
+                  @{author.username}
+                </button>
+              ) : (
+                'pengguna'
+              )}
+            </span>
+          ) : (
+            <span>
+              {isSelfRepost ? (
+                'Merepost postingan sendiri'
+              ) : (
+                <>
+                  Merepost dari{' '}
+                  {orig?.player ? (
+                    <button
+                      type="button"
+                      onClick={() => onOpenProfile(orig.player!.username)}
+                      className="font-medium hover:underline"
+                      style={{ color: 'var(--nz-accent-text)' }}
+                    >
+                      @{orig.player.username}
+                    </button>
+                  ) : (
+                    'pengguna'
+                  )}
+                </>
+              )}
+            </span>
+          )}
         </div>
       )}
 
-      {/* Post Header */}
+      {/* Post Header (Single clean profile header — never doubled) */}
       <div className="px-4 pt-3 pb-2.5 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
           <Avatar
-            player={author}
+            player={displayAuthor}
             size={36}
-            onClick={() => author && onOpenProfile(author.username)}
+            onClick={() => displayAuthor && onOpenProfile(displayAuthor.username)}
           />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <button
                 type="button"
-                onClick={() => author && onOpenProfile(author.username)}
+                onClick={() => displayAuthor && onOpenProfile(displayAuthor.username)}
                 className="font-display text-[15px] font-bold tracking-[-0.5px] truncate hover:opacity-80"
                 style={{ color: 'var(--nz-text)' }}
               >
-                {author?.name || 'Pengguna'}
+                {displayAuthor?.name || 'Pengguna'}
               </button>
-              {author?.is_owner && <OwnerBadge compact />}
+              {displayAuthor?.is_owner && <OwnerBadge compact />}
             </div>
             <div
               className="flex items-center gap-1.5 text-[11px]"
@@ -117,11 +149,11 @@ export const PostCard: React.FC<PostCardProps> = ({
             >
               <button
                 type="button"
-                onClick={() => author && onOpenProfile(author.username)}
+                onClick={() => displayAuthor && onOpenProfile(displayAuthor.username)}
                 className="font-semibold text-[12px] hover:opacity-80 truncate"
                 style={{ color: 'var(--nz-text-muted)' }}
               >
-                @{author?.username || 'user'}
+                @{displayAuthor?.username || 'user'}
               </button>
               <span aria-hidden="true">·</span>
               <span className="uppercase tracking-wide whitespace-nowrap">
@@ -155,12 +187,12 @@ export const PostCard: React.FC<PostCardProps> = ({
                 className="absolute right-0 top-10 z-30 w-48 border rounded-[12px] overflow-hidden py-1 shadow-lg"
                 style={{ background: 'var(--nz-modal-bg)', borderColor: 'var(--nz-border)' }}
               >
-                {author && (
+                {displayAuthor && (
                   <button
                     type="button"
                     onClick={() => {
                       setMenuOpen(false);
-                      onOpenProfile(author.username);
+                      onOpenProfile(displayAuthor.username);
                     }}
                     className="w-full px-3.5 py-2.5 text-left text-[13px] flex items-center gap-2.5 hover:opacity-80"
                     style={{ color: 'var(--nz-text)' }}
@@ -196,17 +228,17 @@ export const PostCard: React.FC<PostCardProps> = ({
                   )
                 )}
 
-                {!isMine && author && (
+                {displayAuthor && displayAuthor.id !== currentUser.id && (
                   <button
                     type="button"
                     onClick={async () => {
                       setMenuOpen(false);
-                      await onBlockUser(author);
+                      await onBlockUser(displayAuthor);
                     }}
                     className="w-full px-3.5 py-2.5 text-left text-[13px] text-[#FF453A] flex items-center gap-2.5"
                   >
                     <Ban className="w-4 h-4" strokeWidth={1.5} />
-                    <span>Blokir @{author.username}</span>
+                    <span>Blokir @{displayAuthor.username}</span>
                   </button>
                 )}
               </div>
@@ -215,72 +247,86 @@ export const PostCard: React.FC<PostCardProps> = ({
         </div>
       </div>
 
-      {/* Repost Caption (if any) */}
-      {isRepost && post.repost_caption && (
-        <div className="px-4 pb-2.5">
-          <RichCaption text={post.repost_caption} onSelectUsername={onOpenProfile} />
-        </div>
-      )}
-
-      {/* Normal Caption (when no media) */}
-      {!isRepost && post.caption && (!post.media_urls || post.media_urls.length === 0) && (
-        <div className="px-4 pb-3">
-          <RichCaption text={post.caption} onSelectUsername={onOpenProfile} />
-        </div>
-      )}
-
-      {/* Embedded Original Post for Repost */}
-      {isRepost ? (
-        <div className="px-4 pb-3">
-          {orig ? (
-            <div
-              className="border rounded-[12px] overflow-hidden"
-              style={{ background: 'var(--nz-elevated)', borderColor: 'var(--nz-border)' }}
-            >
-              <div
-                className="px-3 py-2.5 flex items-center gap-2 border-b"
-                style={{ borderColor: 'var(--nz-border)' }}
-              >
-                <Avatar
-                  player={orig.player}
-                  size={28}
-                  onClick={() => orig.player && onOpenProfile(orig.player.username)}
-                />
-                <div className="min-w-0 flex items-center gap-1.5">
-                  <span
-                    className="font-display text-[13px] font-bold truncate"
-                    style={{ color: 'var(--nz-text)' }}
-                  >
-                    {orig.player?.name || 'Pengguna'}
-                  </span>
-                  {orig.player?.is_owner && <OwnerBadge compact />}
-                  <span className="text-[12px] truncate" style={{ color: 'var(--nz-text-muted)' }}>
-                    @{orig.player?.username}
-                  </span>
-                </div>
-              </div>
-              <PostMedia mediaUrls={orig.media_urls} mediaType={orig.media_type} />
-              {orig.caption && (
-                <div className="px-3 py-2.5">
-                  <RichCaption text={orig.caption} onSelectUsername={onOpenProfile} />
-                </div>
-              )}
-            </div>
-          ) : (
-            <div
-              className="border rounded-[12px] px-3 py-4 text-[13px]"
-              style={{
-                background: 'var(--nz-elevated)',
-                borderColor: 'var(--nz-border)',
-                color: 'var(--nz-text-muted)',
-              }}
-            >
-              Postingan asli sudah dihapus atau tidak tersedia.
+      {/* Repost Body */}
+      {isPureRepost && orig ? (
+        <>
+          {orig.caption && (!orig.media_urls || orig.media_urls.length === 0) && (
+            <div className="px-4 pb-3">
+              <RichCaption text={orig.caption} onSelectUsername={onOpenProfile} />
             </div>
           )}
-        </div>
+          <PostMedia mediaUrls={orig.media_urls} mediaType={orig.media_type} />
+          {orig.caption && orig.media_urls && orig.media_urls.length > 0 && (
+            <div className="px-4 pt-2.5 pb-1">
+              <RichCaption text={orig.caption} onSelectUsername={onOpenProfile} />
+            </div>
+          )}
+        </>
+      ) : isRepost ? (
+        <>
+          {post.repost_caption && (
+            <div className="px-4 pb-2.5">
+              <RichCaption text={post.repost_caption} onSelectUsername={onOpenProfile} />
+            </div>
+          )}
+          <div className="px-4 pb-3">
+            {orig ? (
+              <div
+                className="border rounded-[12px] overflow-hidden"
+                style={{ background: 'var(--nz-elevated)', borderColor: 'var(--nz-border)' }}
+              >
+                {!isSelfRepost && orig.player && (
+                  <div
+                    className="px-3 py-2.5 flex items-center gap-2 border-b"
+                    style={{ borderColor: 'var(--nz-border)' }}
+                  >
+                    <Avatar
+                      player={orig.player}
+                      size={28}
+                      onClick={() => orig.player && onOpenProfile(orig.player.username)}
+                    />
+                    <div className="min-w-0 flex items-center gap-1.5">
+                      <span
+                        className="font-display text-[13px] font-bold truncate"
+                        style={{ color: 'var(--nz-text)' }}
+                      >
+                        {orig.player?.name || 'Pengguna'}
+                      </span>
+                      {orig.player?.is_owner && <OwnerBadge compact />}
+                      <span className="text-[12px] truncate" style={{ color: 'var(--nz-text-muted)' }}>
+                        @{orig.player?.username}
+                      </span>
+                    </div>
+                  </div>
+                )}
+                <PostMedia mediaUrls={orig.media_urls} mediaType={orig.media_type} />
+                {orig.caption && (
+                  <div className="px-3 py-2.5">
+                    <RichCaption text={orig.caption} onSelectUsername={onOpenProfile} />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div
+                className="border rounded-[12px] px-3 py-4 text-[13px]"
+                style={{
+                  background: 'var(--nz-elevated)',
+                  borderColor: 'var(--nz-border)',
+                  color: 'var(--nz-text-muted)',
+                }}
+              >
+                Postingan asli sudah dihapus atau tidak tersedia.
+              </div>
+            )}
+          </div>
+        </>
       ) : (
         <>
+          {post.caption && (!post.media_urls || post.media_urls.length === 0) && (
+            <div className="px-4 pb-3">
+              <RichCaption text={post.caption} onSelectUsername={onOpenProfile} />
+            </div>
+          )}
           <PostMedia mediaUrls={post.media_urls} mediaType={post.media_type} />
           {post.caption && post.media_urls && post.media_urls.length > 0 && (
             <div className="px-4 pt-2.5 pb-1">
