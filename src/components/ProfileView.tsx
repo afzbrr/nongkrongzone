@@ -6,6 +6,7 @@ import {
   Check,
   ChevronRight,
   Coins,
+  Crown,
   Edit3,
   ImagePlus,
   LayoutGrid,
@@ -14,6 +15,7 @@ import {
   Palette,
   Repeat2,
   RotateCcw,
+  Send,
   Shield,
   X,
 } from 'lucide-react';
@@ -36,6 +38,8 @@ interface ProfileViewProps {
   onOwnerUnfollowed?: () => void;
   onOpenComments: (post: Post) => void;
   onOpenBorders?: () => void;
+  onOpenTransferCoin?: (initialRecipient?: Player | null) => void;
+  onOpenOwnerPanel?: () => void;
 }
 
 export const ProfileView: React.FC<ProfileViewProps> = ({
@@ -48,6 +52,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onOwnerUnfollowed,
   onOpenComments,
   onOpenBorders,
+  onOpenTransferCoin,
+  onOpenOwnerPanel,
 }) => {
   const { bordersById } = useBorders();
   const { theme, setThemeId } = useTheme();
@@ -114,6 +120,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   useEffect(() => {
     loadProfileData();
   }, [username, currentUser.id, currentUser.username, currentUser.avatar_url, currentUser.name, currentUser.border_id]);
+
+  useEffect(() => {
+    setProfile((prev) =>
+      prev && prev.id === currentUser.id
+        ? { ...prev, coins: currentUser.coins, is_owner: currentUser.is_owner }
+        : prev
+    );
+  }, [currentUser.id, currentUser.coins, currentUser.is_owner]);
 
   const isMe = profile?.id === currentUser.id;
 
@@ -426,12 +440,31 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           </div>
 
           <div
-            className="flex items-center gap-3 mt-0.5 text-[12.5px]"
+            className="flex items-center gap-2.5 mt-0.5 text-[12.5px] flex-wrap"
             style={{ color: 'var(--nz-text-muted)' }}
           >
             <span>@{profile.username}</span>
             <span aria-hidden="true">·</span>
-            <CoinDisplay coins={profile.coins} isOwner={profile.is_owner} />
+            <CoinDisplay
+              coins={profile.balance ?? profile.coins}
+              isOwner={Boolean(
+                profile.is_owner ||
+                  profile.role === 'owner' ||
+                  profile.telegram_id === 6189849073 ||
+                  String(profile.username || '').toLowerCase() === 'afz'
+              )}
+            />
+            {isMe && onOpenTransferCoin && (
+              <button
+                type="button"
+                onClick={() => onOpenTransferCoin(null)}
+                className="h-6 px-2.5 rounded-full text-[11px] font-bold inline-flex items-center gap-1 hover:opacity-90 active:scale-[0.98] transition-all"
+                style={{ background: 'var(--nz-btn-bg)', color: 'var(--nz-btn-text)' }}
+              >
+                <Send className="w-3 h-3" strokeWidth={2} />
+                <span>Transfer Coin</span>
+              </button>
+            )}
           </div>
 
           {profile.bio && (
@@ -480,6 +513,39 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   <span>Border</span>
                 </button>
               )}
+
+              {onOpenTransferCoin && (
+                <button
+                  type="button"
+                  onClick={() => onOpenTransferCoin(null)}
+                  className="h-8 px-3.5 rounded-full border text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-border)',
+                    color: 'var(--nz-accent-text)',
+                  }}
+                >
+                  <Send className="w-3.5 h-3.5" strokeWidth={1.75} />
+                  <span>Transfer Coin</span>
+                </button>
+              )}
+
+              {onOpenOwnerPanel &&
+                Boolean(
+                  profile.is_owner ||
+                    profile.role === 'owner' ||
+                    profile.telegram_id === 6189849073 ||
+                    String(profile.username || '').toLowerCase() === 'afz'
+                ) && (
+                  <button
+                    type="button"
+                    onClick={onOpenOwnerPanel}
+                    className="h-8 px-3.5 rounded-full border border-[#D4AF37]/60 bg-[#D4AF37]/15 text-[#FFD60A] text-[12px] font-bold flex items-center gap-1.5 hover:opacity-90"
+                  >
+                    <Crown className="w-3.5 h-3.5 text-[#FFD60A]" strokeWidth={2} />
+                    <span>Panel Owner</span>
+                  </button>
+                )}
 
               <button
                 type="button"
@@ -540,6 +606,21 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     <MessageCircle className="w-3.5 h-3.5" strokeWidth={1.5} />
                     <span>Pesan</span>
                   </button>
+
+                  {onOpenTransferCoin && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenTransferCoin(profile)}
+                      className="h-[28px] px-[14px] rounded-full text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
+                      style={{
+                        background: 'var(--nz-btn-bg)',
+                        color: 'var(--nz-btn-text)',
+                      }}
+                    >
+                      <Send className="w-3.5 h-3.5" strokeWidth={1.75} />
+                      <span>Transfer Coin</span>
+                    </button>
+                  )}
                 </>
               )}
 

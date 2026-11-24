@@ -245,17 +245,279 @@ function isOwnerByTelegramId(telegramId: unknown): boolean {
   return Number(telegramId) === OWNER_TELEGRAM_ID;
 }
 
+function isUnlimitedOwner(row: any): boolean {
+  if (!row) return false;
+  return Boolean(
+    isOwnerByTelegramId(row.telegram_id) ||
+      row.is_owner === true ||
+      String(row.role || '').trim().toLowerCase() === 'owner' ||
+      String(row.username || '').trim().toLowerCase() === 'afz'
+  );
+}
+
+function resolveRowBalance(row: any): number {
+  if (!row) return 0;
+  if (isUnlimitedOwner(row)) return OWNER_COINS;
+  const hasBal = row.balance !== undefined && row.balance !== null;
+  const hasCoins = row.coins !== undefined && row.coins !== null;
+  if (hasBal && hasCoins) {
+    const b = Number(row.balance || 0);
+    const c = Number(row.coins || 0);
+    return b === 0 && c > 0 ? c : b;
+  }
+  return Number(hasBal ? row.balance : row.coins || 0);
+}
+
+function formatCoinsId(val: number): string {
+  return Math.trunc(val).toLocaleString('id-ID');
+}
+
+function getWibTodayStartIso(): string {
+  const now = new Date();
+  const wibStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' }); // YYYY-MM-DD
+  return new Date(`${wibStr}T00:00:00+07:00`).toISOString();
+}
+
+async function updatePlayerCoinsAndBalance(
+  sb: SupabaseClient,
+  playerId: string,
+  nextAmount: number,
+  extraUpdates: Record<string, any> = {}
+) {
+  const safeVal = Math.max(0, Math.trunc(nextAmount));
+  const payload = { ...extraUpdates, coins: safeVal, balance: safeVal };
+  let { data, error } = await sb
+    .from('players')
+    .update(payload)
+    .eq('id', playerId)
+    .select('*')
+    .maybeSingle();
+
+  if (error && /column|schema cache|PGRST204/i.test(String(error.message || ''))) {
+    const fallbackPayload = { ...extraUpdates, coins: safeVal };
+    const retry = await sb
+      .from('players')
+      .update(fallbackPayload)
+      .eq('id', playerId)
+      .select('*')
+      .maybeSingle();
+    data = retry.data;
+    error = retry.error;
+  }
+  if (error) throw error;
+  return data;
+}
+
+async function insertNotificationSafe(
+  sb: SupabaseClient,
+  opts: {
+    toPlayerId: string;
+    fromPlayerId?: string | null;
+    type?: string;
+    title: string;
+    message?: string | null;
+    postId?: string | null;
+  }
+) {
+  const payloads: Array<Record<string, any>> = [
+    {
+      user_id: opts.toPlayerId,
+      to_player_id: opts.toPlayerId,
+      from_player_id: opts.fromPlayerId ?? null,
+      type: opts.type || 'transfer',
+      title: opts.title,
+      message: opts.message ?? opts.title,
+      post_id: opts.postId ?? null,
+      is_read: false,
+    },
+    {
+      user_id: opts.toPlayerId,
+      title: opts.title,
+      message: opts.message ?? opts.title,
+      is_read: false,
+    },
+    {
+      to_player_id: opts.toPlayerId,
+      from_player_id: opts.fromPlayerId ?? null,
+      type: opts.type || 'transfer',
+      title: opts.message || opts.title,
+      post_id: opts.postId ?? null,
+      is_read: false,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const { data, error } = await sb.from('notifications').insert(payload).select('*').maybeSingle();
+    if (!error && data) return data;
+    const msg = String(error?.message || '');
+    if (!/column|schema cache|PGRST204|null value/i.test(msg)) {
+      console.warn('[notifications] Insert warning:', msg);
+      return null;
+    }
+  }
+  return null;
+}
+
+async function recordTransferTransaction(
+  sb: SupabaseClient,
+  opts: {
+    senderId: string;
+    recipientId: string;
+    amount: number;
+    senderUsername: string;
+    recipientUsername: string;
+    txType?: string;
+    note?: string;
+  }
+): Promise<boolean> {
+  const txType = opts.txType || 'transfer';
+  const noteText = opts.note || `Transfer ke @${opts.recipientUsername}`;
+  const payloads: Array<Record<string, any>> = [
+    {
+      sender_id: opts.senderId,
+      receiver_id: opts.recipientId,
+      amount: opts.amount,
+      tx_type: txType,
+      note: noteText,
+    },
+    {
+      sender_id: opts.senderId,
+      receiver_id: opts.recipientId,
+      amount: opts.amount,
+      type: txType,
+      note: noteText,
+    },
+    {
+      from_player_id: opts.senderId,
+      to_player_id: opts.recipientId,
+      amount: opts.amount,
+      type: txType,
+      note: noteText,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const { error } = await sb.from('transactions').insert(payload);
+    if (!error) return true;
+    const msg = String(error.message || '');
+    if (/relation .*transactions.* does not exist|Could not find the table/i.test(msg)) {
+      console.warn('[transactions] Table `transactions` not found in Supabase:', msg);
+      return false;
+    }
+    if (!/column|schema cache|PGRST204/i.test(msg)) {
+      console.warn('[transactions] Insert warning:', msg);
+      return false;
+    }
+  }
+  return false;
+}
+
+const OWNER_PANEL_DATA_DIR = path.resolve(process.cwd(), 'data');
+const OWNER_PANEL_STORE_PATH = path.resolve(OWNER_PANEL_DATA_DIR, 'owner-panel.json');
+
+interface BroadcastRow {
+  id: string;
+  title: string;
+  message: string;
+  scheduled_at: string;
+  is_active: boolean;
+  created_by: string | null;
+  created_at: string;
+}
+
+interface GiveawayRow {
+  id: string;
+  amount_per_user: number;
+  max_winners: number;
+  claimed_count: number;
+  scheduled_at: string;
+  status: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+interface GiveawayClaimRow {
+  id: string;
+  giveaway_id: string;
+  user_id: string;
+  amount: number;
+  claimed_at: string;
+}
+
+interface OwnerPanelFallbackData {
+  broadcasts: BroadcastRow[];
+  giveaways: GiveawayRow[];
+  claims: GiveawayClaimRow[];
+}
+
+function isMissingRelationError(err: any): boolean {
+  if (!err) return false;
+  const code = String(err.code || '');
+  const msg = String(err.message || '');
+  return (
+    code === 'PGRST205' ||
+    code === '42P01' ||
+    /relation .* does not exist|Could not find the table/i.test(msg)
+  );
+}
+
+function readOwnerPanelFallback(): OwnerPanelFallbackData {
+  try {
+    if (!fs.existsSync(OWNER_PANEL_STORE_PATH)) {
+      return { broadcasts: [], giveaways: [], claims: [] };
+    }
+    const raw = fs.readFileSync(OWNER_PANEL_STORE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      broadcasts: Array.isArray(parsed?.broadcasts) ? parsed.broadcasts : [],
+      giveaways: Array.isArray(parsed?.giveaways) ? parsed.giveaways : [],
+      claims: Array.isArray(parsed?.claims) ? parsed.claims : [],
+    };
+  } catch {
+    return { broadcasts: [], giveaways: [], claims: [] };
+  }
+}
+
+function writeOwnerPanelFallback(data: OwnerPanelFallbackData) {
+  fs.mkdirSync(OWNER_PANEL_DATA_DIR, { recursive: true });
+  const tmpPath = `${OWNER_PANEL_STORE_PATH}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmpPath, OWNER_PANEL_STORE_PATH);
+}
+
+const dropLockQueues = new Map<string, Promise<any>>();
+function withDropLock<T>(dropId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = dropLockQueues.get(dropId) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  dropLockQueues.set(
+    dropId,
+    next.catch(() => {})
+  );
+  return next;
+}
+
+function isMissingLocalUpload(url: unknown): boolean {
+  if (typeof url !== 'string' || !url.startsWith('/uploads/')) return false;
+  const filename = path.basename(url);
+  if (!filename) return true;
+  const resolved = path.resolve(UPLOADS_DIR, filename);
+  if (!resolved.startsWith(UPLOADS_DIR + path.sep)) return true;
+  return !fs.existsSync(resolved);
+}
+
 function normalizePlayer(row: any): any {
   if (!row) return row;
-  const isOwner = isOwnerByTelegramId(row.telegram_id);
+  const isOwner = isUnlimitedOwner(row);
   const fullName = String(row.full_name || row.name || row.username || 'Pengguna');
-  const tgAvatar =
+  const rawTgAvatar =
     row.telegram_avatar_url !== undefined
       ? row.telegram_avatar_url
       : telegramAvatarMemoryCache.get(String(row.id)) ?? null;
+  const tgAvatar = isMissingLocalUpload(rawTgAvatar) ? null : rawTgAvatar;
   if (tgAvatar && row.id) {
     telegramAvatarMemoryCache.set(String(row.id), tgAvatar);
   }
+  const cleanAvatarUrl = isMissingLocalUpload(row.avatar_url) ? tgAvatar || null : row.avatar_url;
   const cachedHasTgUsername = row.id ? telegramHasUsernameCache.get(String(row.id)) : undefined;
   const hasTelegramUsername =
     cachedHasTgUsername !== undefined
@@ -263,14 +525,18 @@ function normalizePlayer(row: any): any {
       : isOwner
         ? true
         : !/^tg_\d+/.test(String(row.username || ''));
+  const resolvedBalance = resolveRowBalance(row);
   return {
     ...row,
+    avatar_url: cleanAvatarUrl,
     name: fullName,
     full_name: fullName,
     telegram_avatar_url: tgAvatar,
     is_owner: isOwner,
+    role: isOwner ? 'owner' : String(row.role || 'user'),
     has_telegram_username: hasTelegramUsername,
-    coins: isOwner ? OWNER_COINS : Number(row.coins || 0),
+    coins: resolvedBalance,
+    balance: resolvedBalance,
   };
 }
 
@@ -298,16 +564,17 @@ async function syncProfilesTable(sb: SupabaseClient, playerRow: any) {
   }
 }
 
-function signSessionToken(playerId: string): string {
-  const payload = Buffer.from(
-    JSON.stringify({ pid: playerId, iat: Date.now() }),
-    'utf8'
-  ).toString('base64url');
+function signSessionToken(playerId: string, hasTgUser?: boolean): string {
+  const payloadObj: Record<string, unknown> = { pid: playerId, iat: Date.now() };
+  if (typeof hasTgUser === 'boolean') {
+    payloadObj.hasTgUser = hasTgUser;
+  }
+  const payload = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
   return `${payload}.${sig}`;
 }
 
-function verifySessionToken(token: string): string | null {
+function verifySessionToken(token: string): { pid: string; hasTgUser?: boolean } | null {
   try {
     const [payload, sig] = token.split('.');
     if (!payload || !sig) return null;
@@ -319,7 +586,11 @@ function verifySessionToken(token: string): string | null {
     const b = Buffer.from(expectedSig, 'utf8');
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
     const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return isUuid(decoded?.pid) ? decoded.pid : null;
+    if (!isUuid(decoded?.pid)) return null;
+    return {
+      pid: decoded.pid,
+      hasTgUser: typeof decoded.hasTgUser === 'boolean' ? decoded.hasTgUser : undefined,
+    };
   } catch {
     return null;
   }
@@ -564,16 +835,19 @@ function isPlayerOnline(playerId: string): boolean {
   return false;
 }
 
-async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
+async function resolveAuthenticatedPlayerOnly(sb: SupabaseClient, req: Request) {
   const authHeader = req.header('authorization') || '';
   if (authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    const tokenPid = verifySessionToken(token);
-    if (tokenPid) {
+    const tokenPayload = verifySessionToken(token);
+    if (tokenPayload?.pid) {
+      if (tokenPayload.hasTgUser !== undefined) {
+        telegramHasUsernameCache.set(tokenPayload.pid, tokenPayload.hasTgUser);
+      }
       const { data: foundByToken } = await sb
         .from('players')
         .select('*')
-        .eq('id', tokenPid)
+        .eq('id', tokenPayload.pid)
         .eq('is_banned', false)
         .maybeSingle();
       if (foundByToken) return normalizePlayer(foundByToken);
@@ -591,6 +865,23 @@ async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
     if (found) return normalizePlayer(found);
   }
 
+  return null;
+}
+
+async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
+  const resolved = await resolveAuthenticatedPlayerOnly(sb, req);
+  if (resolved) return resolved;
+
+  if (req.header('x-no-owner-fallback') === '1') {
+    const authErr = new Error('Silakan buka aplikasi langsung lewat Bot Telegram.') as Error & {
+      status?: number;
+      code?: string;
+    };
+    authErr.status = 401;
+    authErr.code = 'TELEGRAM_AUTH_REQUIRED';
+    throw authErr;
+  }
+
   const { data: existingOwner, error: selectErr } = await sb
     .from('players')
     .select('*')
@@ -599,8 +890,11 @@ async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
 
   if (selectErr) throw selectErr;
   if (existingOwner) {
-    if (!existingOwner.avatar_url) {
-      const fetchedAv = await fetchTelegramAvatarFromBotApi(sb, OWNER_TELEGRAM_ID);
+    if (!existingOwner.avatar_url || isMissingLocalUpload(existingOwner.avatar_url)) {
+      const fetchedAv = await Promise.race([
+        fetchTelegramAvatarFromBotApi(sb, OWNER_TELEGRAM_ID),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 650)),
+      ]);
       if (fetchedAv) {
         const updatePayload: Record<string, any> = { avatar_url: fetchedAv };
         const caps = await detectAuthSchemaCaps(sb);
@@ -1048,20 +1342,13 @@ async function startServer() {
       }
 
       const price = Number(border.price_coins || 0);
-      const currentCoins = Number(me.coins || 0);
+      const currentCoins = resolveRowBalance(me);
       if (currentCoins < price) {
         return res.status(400).json({ error: 'Coin tidak cukup' });
       }
 
       const newCoins = currentCoins - price;
-      const { data: updatedPlayer, error: uErr } = await sb
-        .from('players')
-        .update({ coins: newCoins })
-        .eq('id', me.id)
-        .gte('coins', price)
-        .select('*')
-        .maybeSingle();
-      if (uErr) throw uErr;
+      const updatedPlayer = await updatePlayerCoinsAndBalance(sb, me.id, newCoins);
       if (!updatedPlayer) {
         return res.status(400).json({ error: 'Coin tidak cukup' });
       }
@@ -1078,7 +1365,7 @@ async function startServer() {
 
       return res.json({
         ok: true,
-        coins: Number(updatedPlayer.coins),
+        coins: resolveRowBalance(updatedPlayer),
         border,
       });
     } catch (err: any) {
@@ -1143,12 +1430,830 @@ async function startServer() {
     }
   });
 
+  // Transfer Coins between users with Owner Infinity rule, transactions log, & real-time notification
+  app.post('/api/coins/transfer', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const rawAmount = Number(req.body?.amount);
+      if (!Number.isFinite(rawAmount) || !Number.isInteger(rawAmount) || rawAmount <= 0) {
+        return res.status(400).json({ error: 'Jumlah coin harus lebih dari 0' });
+      }
+      if (rawAmount > 1_000_000_000) {
+        return res.status(400).json({ error: 'Jumlah coin melebihi batas maksimal' });
+      }
+      const amount = Math.trunc(rawAmount);
+
+      const rawToId = typeof req.body?.to_player_id === 'string' ? req.body.to_player_id.trim() : '';
+      const rawToUsername =
+        typeof req.body?.to_username === 'string'
+          ? req.body.to_username.trim().replace(/^@/, '')
+          : '';
+
+      if (!rawToId && !rawToUsername) {
+        return res.status(400).json({ error: 'Pilih penerima transfer terlebih dahulu' });
+      }
+
+      let recipientRow: any = null;
+      if (rawToId) {
+        if (!isUuid(rawToId)) {
+          return res.status(400).json({ error: 'ID penerima tidak valid' });
+        }
+        const { data } = await sb
+          .from('players')
+          .select('*')
+          .eq('id', rawToId)
+          .eq('is_banned', false)
+          .maybeSingle();
+        recipientRow = data;
+      } else {
+        const { data } = await sb
+          .from('players')
+          .select('*')
+          .ilike('username', rawToUsername)
+          .eq('is_banned', false)
+          .maybeSingle();
+        recipientRow = data;
+      }
+
+      if (!recipientRow) {
+        return res.status(404).json({ error: 'Pengguna tujuan tidak ditemukan' });
+      }
+
+      if (recipientRow.id === me.id) {
+        return res.status(400).json({ error: 'Tidak boleh transfer ke diri sendiri' });
+      }
+
+      const { data: freshSender, error: senderFetchErr } = await sb
+        .from('players')
+        .select('*')
+        .eq('id', me.id)
+        .eq('is_banned', false)
+        .maybeSingle();
+      if (senderFetchErr) throw senderFetchErr;
+      if (!freshSender) {
+        return res.status(404).json({ error: 'Akun pengirim tidak ditemukan' });
+      }
+
+      const senderIsOwner = isUnlimitedOwner(freshSender);
+      const recipientIsOwner = isUnlimitedOwner(recipientRow);
+
+      let senderCoinsAfter = OWNER_COINS;
+      let updatedSenderRow = freshSender;
+
+      if (!senderIsOwner) {
+        const currentSenderCoins = resolveRowBalance(freshSender);
+        if (currentSenderCoins < amount) {
+          return res.status(400).json({ error: 'Saldo tidak cukup' });
+        }
+        const nextSenderCoins = currentSenderCoins - amount;
+        const deductedSender = await updatePlayerCoinsAndBalance(sb, me.id, nextSenderCoins);
+        if (!deductedSender) {
+          return res.status(400).json({ error: 'Saldo tidak cukup' });
+        }
+        updatedSenderRow = deductedSender;
+        senderCoinsAfter = resolveRowBalance(deductedSender);
+      }
+
+      let recipientCoinsAfter = OWNER_COINS;
+      let updatedRecipientRow = recipientRow;
+
+      if (!recipientIsOwner) {
+        const currentRecipientCoins = resolveRowBalance(recipientRow);
+        const nextRecipientCoins = currentRecipientCoins + amount;
+        let creditedRecipient: any = null;
+        try {
+          creditedRecipient = await updatePlayerCoinsAndBalance(sb, recipientRow.id, nextRecipientCoins);
+        } catch (creditErr: any) {
+          if (!senderIsOwner) {
+            await updatePlayerCoinsAndBalance(sb, me.id, resolveRowBalance(freshSender)).catch(() => {});
+          }
+          throw creditErr;
+        }
+        if (!creditedRecipient) {
+          if (!senderIsOwner) {
+            await updatePlayerCoinsAndBalance(sb, me.id, resolveRowBalance(freshSender)).catch(() => {});
+          }
+          throw new Error('Gagal menambahkan saldo penerima');
+        }
+        updatedRecipientRow = creditedRecipient;
+        recipientCoinsAfter = resolveRowBalance(creditedRecipient);
+      }
+
+      await Promise.all([
+        !senderIsOwner ? syncProfilesTable(sb, updatedSenderRow) : Promise.resolve(),
+        !recipientIsOwner ? syncProfilesTable(sb, updatedRecipientRow) : Promise.resolve(),
+      ]);
+
+      const transactionRecorded = await recordTransferTransaction(sb, {
+        senderId: me.id,
+        recipientId: recipientRow.id,
+        amount,
+        senderUsername: me.username,
+        recipientUsername: recipientRow.username,
+        txType: 'transfer',
+        note: `Transfer ke @${recipientRow.username}`,
+      });
+
+      const notifMessage = `Kamu menerima ${formatCoinsId(amount)} coin dari @${me.username}`;
+      const notif = await insertNotificationSafe(sb, {
+        toPlayerId: recipientRow.id,
+        fromPlayerId: me.id,
+        type: 'transfer',
+        title: 'Terima Coin',
+        message: notifMessage,
+      });
+
+      const normSender = normalizePlayer(updatedSenderRow);
+      if (notif) {
+        broadcastToPlayer(recipientRow.id, 'notification:new', {
+          ...notif,
+          title: notif.title || 'Terima Coin',
+          message: notif.message || notifMessage,
+          from_player: normSender,
+        });
+      }
+      broadcastToPlayer(recipientRow.id, 'coin:transfer_received', {
+        amount,
+        from_player: normSender,
+        new_coins: recipientCoinsAfter,
+        notification_id: notif?.id || null,
+        title: 'Terima Coin',
+        message: notifMessage,
+      });
+
+      return res.json({
+        ok: true,
+        amount,
+        senderCoins: senderCoinsAfter,
+        recipient: normalizePlayer(updatedRecipientRow),
+        transactionRecorded,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal mengirim coin' });
+    }
+  });
+
+  // Public Supabase Realtime client config (returns ONLY public ANON key, never service role key)
+  app.get('/api/realtime-config', (_req: Request, res: Response) => {
+    const url = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
+    const anonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    if (!url || !anonKey) {
+      return res.json({ enabled: false, url: null, anonKey: null });
+    }
+    return res.json({ enabled: true, url, anonKey });
+  });
+
+  // =========================================================================
+  // OWNER PANEL: Broadcasts, Giveaways (Bagi-Bagi Coin WIB), & Stats
+  // =========================================================================
+  async function fetchAllBroadcasts(sb: SupabaseClient): Promise<BroadcastRow[]> {
+    const { data, error } = await sb
+      .from('broadcasts')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (!error && Array.isArray(data)) {
+      return data.map((b: any) => ({
+        id: b.id,
+        title: String(b.title || 'Pengumuman Owner'),
+        message: String(b.message || ''),
+        scheduled_at: b.scheduled_at || b.created_at,
+        is_active: Boolean(b.is_active),
+        created_by: b.created_by ?? null,
+        created_at: b.created_at,
+      }));
+    }
+    if (error && !isMissingRelationError(error)) {
+      throw error;
+    }
+    return readOwnerPanelFallback().broadcasts.sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+  }
+
+  async function fetchAllGiveaways(sb: SupabaseClient): Promise<{
+    giveaways: GiveawayRow[];
+    claims: GiveawayClaimRow[];
+  }> {
+    const [gRes, cRes] = await Promise.all([
+      sb.from('giveaways').select('*').order('scheduled_at', { ascending: true }),
+      sb.from('giveaway_claims').select('*').order('claimed_at', { ascending: false }),
+    ]);
+
+    if (!gRes.error && !cRes.error && Array.isArray(gRes.data) && Array.isArray(cRes.data)) {
+      return {
+        giveaways: gRes.data.map((g: any) => ({
+          id: g.id,
+          amount_per_user: Number(g.amount_per_user || 0),
+          max_winners: Number(g.max_winners || 0),
+          claimed_count: Number(g.claimed_count || 0),
+          scheduled_at: g.scheduled_at,
+          status: String(g.status || 'scheduled'),
+          created_by: g.created_by ?? null,
+          created_at: g.created_at,
+        })),
+        claims: cRes.data.map((c: any) => ({
+          id: c.id,
+          giveaway_id: c.giveaway_id,
+          user_id: c.user_id,
+          amount: Number(c.amount || 0),
+          claimed_at: c.claimed_at || c.created_at,
+        })),
+      };
+    }
+
+    if (gRes.error && !isMissingRelationError(gRes.error)) {
+      throw gRes.error;
+    }
+    if (cRes.error && !isMissingRelationError(cRes.error)) {
+      throw cRes.error;
+    }
+
+    const fb = readOwnerPanelFallback();
+    return {
+      giveaways: [...fb.giveaways].sort(
+        (a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime()
+      ),
+      claims: [...fb.claims].sort(
+        (a, b) => new Date(b.claimed_at).getTime() - new Date(a.claimed_at).getTime()
+      ),
+    };
+  }
+
+  async function fetchOwnerStats(sb: SupabaseClient) {
+    const todayStartIso = getWibTodayStartIso();
+    const [playersRes, txRes] = await Promise.all([
+      sb.from('players').select('id, username, role, is_owner, telegram_id, coins, balance, is_banned'),
+      sb
+        .from('transactions')
+        .select('amount, tx_type, created_at')
+        .gte('created_at', todayStartIso),
+    ]);
+
+    const playerRows = (playersRes.data || []).filter((p: any) => !p.is_banned);
+    const totalUsers = playerRows.length;
+    const totalCoinsCirculating = playerRows.reduce((sum: number, p: any) => {
+      if (isUnlimitedOwner(p)) return sum;
+      return sum + resolveRowBalance(p);
+    }, 0);
+
+    const txRows = (txRes.data || []).filter(
+      (t: any) => !t.tx_type || String(t.tx_type).toLowerCase() === 'transfer'
+    );
+    const todayTransfersCount = txRows.length;
+    const todayTransfersVolume = txRows.reduce((sum: number, t: any) => sum + Number(t.amount || 0), 0);
+
+    return {
+      totalUsers,
+      totalCoinsCirculating,
+      todayTransfersCount,
+      todayTransfersVolume,
+    };
+  }
+
+  async function buildHydratedOwnerPanelState(sb: SupabaseClient, me: any | null) {
+    const nowMs = Date.now();
+    const isOwnerCaller = isUnlimitedOwner(me);
+    const [allBroadcasts, { giveaways, claims }, stats] = await Promise.all([
+      fetchAllBroadcasts(sb),
+      fetchAllGiveaways(sb),
+      isOwnerCaller ? fetchOwnerStats(sb).catch(() => null) : Promise.resolve(null),
+    ]);
+
+    const activeBroadcasts = allBroadcasts.filter((b) => {
+      if (!b.is_active) return false;
+      const schedMs = new Date(b.scheduled_at).getTime();
+      return Number.isFinite(schedMs) && schedMs <= nowMs;
+    });
+
+    const claimsByGiveaway = new Map<string, GiveawayClaimRow[]>();
+    for (const c of claims) {
+      const list = claimsByGiveaway.get(c.giveaway_id) || [];
+      list.push(c);
+      claimsByGiveaway.set(c.giveaway_id, list);
+    }
+
+    let claimerMap = new Map<string, any>();
+    if (isOwnerCaller && claims.length > 0) {
+      const claimerIds = Array.from(new Set(claims.map((c) => c.user_id).filter(Boolean)));
+      if (claimerIds.length > 0) {
+        const { data: pRows } = await sb.from('players').select('*').in('id', claimerIds);
+        for (const p of pRows || []) {
+          claimerMap.set(p.id, normalizePlayer(p));
+        }
+      }
+    }
+
+    const hydratedGiveaways = giveaways
+      .filter((g) => {
+        if (isOwnerCaller) return true;
+        return g.status !== 'cancelled';
+      })
+      .map((g) => {
+        const gClaims = claimsByGiveaway.get(g.id) || [];
+        const effectiveClaimed = Math.max(g.claimed_count || 0, gClaims.length);
+        let effectiveStatus = g.status;
+        const schedMs = new Date(g.scheduled_at).getTime();
+        if (effectiveStatus !== 'cancelled' && effectiveStatus !== 'ended') {
+          if (effectiveClaimed >= g.max_winners) {
+            effectiveStatus = 'ended';
+          } else if (Number.isFinite(schedMs) && schedMs <= nowMs) {
+            effectiveStatus = 'live';
+          } else {
+            effectiveStatus = 'scheduled';
+          }
+        }
+        return {
+          ...g,
+          claimed_count: effectiveClaimed,
+          status: effectiveStatus,
+          claimed_by_me: me ? gClaims.some((c) => c.user_id === me.id) : false,
+          ...(isOwnerCaller
+            ? {
+                claims: gClaims.map((c) => ({
+                  ...c,
+                  player: claimerMap.get(c.user_id),
+                })),
+              }
+            : {}),
+        };
+      });
+
+    return {
+      activeBroadcasts,
+      ...(isOwnerCaller ? { allBroadcasts, stats } : {}),
+      giveaways: hydratedGiveaways,
+      serverNow: new Date(nowMs).toISOString(),
+    };
+  }
+
+  app.get('/api/owner/panel-state', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      let me: any = null;
+      try {
+        me = await ensureOwnerAndResolvePlayer(sb, req);
+      } catch {
+        me = null;
+      }
+      const state = await buildHydratedOwnerPanelState(sb, me);
+      return res.json(state);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal memuat data panel owner' });
+    }
+  });
+
+  app.post('/api/owner/broadcasts', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat membuat broadcast' });
+      }
+
+      const title =
+        typeof req.body?.title === 'string' && req.body.title.trim()
+          ? req.body.title.trim().slice(0, 80)
+          : 'Pengumuman Owner';
+      const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+      if (!message || message.length > 240) {
+        return res.status(400).json({ error: 'Isi pesan broadcast wajib diisi (maks. 240 karakter)' });
+      }
+
+      const rawSched = req.body?.scheduled_at ? new Date(String(req.body.scheduled_at)).getTime() : Date.now();
+      const scheduledAtIso = Number.isFinite(rawSched)
+        ? new Date(rawSched).toISOString()
+        : new Date().toISOString();
+      const isActive = req.body?.is_active !== false;
+
+      const newRow: BroadcastRow = {
+        id: crypto.randomUUID(),
+        title,
+        message,
+        scheduled_at: scheduledAtIso,
+        is_active: isActive,
+        created_by: me.id,
+        created_at: new Date().toISOString(),
+      };
+
+      const { data: inserted, error: insErr } = await sb
+        .from('broadcasts')
+        .insert(newRow)
+        .select('*')
+        .maybeSingle();
+
+      let saved = inserted as BroadcastRow | null;
+      if (insErr) {
+        if (!isMissingRelationError(insErr)) throw insErr;
+        const fb = readOwnerPanelFallback();
+        fb.broadcasts.unshift(newRow);
+        writeOwnerPanelFallback(fb);
+        saved = newRow;
+      }
+
+      broadcastToAll('owner_panel:updated', { reason: 'broadcast_created', id: saved?.id || newRow.id });
+      return res.json({ broadcast: saved || newRow });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal membuat broadcast' });
+    }
+  });
+
+  app.patch('/api/owner/broadcasts/:id', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat mengedit broadcast' });
+      }
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'ID broadcast tidak valid' });
+
+      const updates: Record<string, any> = {};
+      if (typeof req.body?.title === 'string') {
+        updates.title = req.body.title.trim().slice(0, 80) || 'Pengumuman Owner';
+      }
+      if (typeof req.body?.message === 'string') {
+        const msg = req.body.message.trim();
+        if (!msg || msg.length > 240) {
+          return res.status(400).json({ error: 'Isi pesan broadcast wajib diisi (maks. 240 karakter)' });
+        }
+        updates.message = msg;
+      }
+      if (req.body?.scheduled_at) {
+        const ms = new Date(String(req.body.scheduled_at)).getTime();
+        if (!Number.isFinite(ms)) {
+          return res.status(400).json({ error: 'Waktu jadwal WIB tidak valid' });
+        }
+        updates.scheduled_at = new Date(ms).toISOString();
+      }
+      if (typeof req.body?.is_active === 'boolean') {
+        updates.is_active = req.body.is_active;
+      }
+
+      const { data: updated, error: updErr } = await sb
+        .from('broadcasts')
+        .update(updates)
+        .eq('id', id)
+        .select('*')
+        .maybeSingle();
+
+      let saved = updated as BroadcastRow | null;
+      if (updErr) {
+        if (!isMissingRelationError(updErr)) throw updErr;
+        const fb = readOwnerPanelFallback();
+        fb.broadcasts = fb.broadcasts.map((b) => (b.id === id ? { ...b, ...updates } : b));
+        writeOwnerPanelFallback(fb);
+        saved = fb.broadcasts.find((b) => b.id === id) || null;
+      }
+
+      broadcastToAll('owner_panel:updated', { reason: 'broadcast_updated', id });
+      return res.json({ broadcast: saved });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal memperbarui broadcast' });
+    }
+  });
+
+  app.delete('/api/owner/broadcasts/:id', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat menghapus broadcast' });
+      }
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'ID broadcast tidak valid' });
+
+      const { error: delErr } = await sb.from('broadcasts').delete().eq('id', id);
+      if (delErr) {
+        if (!isMissingRelationError(delErr)) throw delErr;
+        const fb = readOwnerPanelFallback();
+        fb.broadcasts = fb.broadcasts.filter((b) => b.id !== id);
+        writeOwnerPanelFallback(fb);
+      }
+
+      broadcastToAll('owner_panel:updated', { reason: 'broadcast_deleted', id });
+      return res.json({ ok: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal menghapus broadcast' });
+    }
+  });
+
+  app.post('/api/owner/giveaways', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat membuat event bagi-bagi coin' });
+      }
+
+      const amountPerUser = Number(req.body?.amount_per_user);
+      const maxWinners = Number(req.body?.max_winners);
+      if (!Number.isInteger(amountPerUser) || amountPerUser <= 0 || amountPerUser > 1_000_000_000) {
+        return res.status(400).json({ error: 'Jumlah coin per orang harus lebih dari 0' });
+      }
+      if (!Number.isInteger(maxWinners) || maxWinners <= 0 || maxWinners > 10_000) {
+        return res.status(400).json({ error: 'Jumlah penerima minimal 1 dan maksimal 10.000 orang' });
+      }
+
+      const rawSched = req.body?.scheduled_at ? new Date(String(req.body.scheduled_at)).getTime() : Date.now();
+      if (!Number.isFinite(rawSched)) {
+        return res.status(400).json({ error: 'Waktu bagi-bagi coin WIB tidak valid' });
+      }
+      const isLiveNow = rawSched <= Date.now();
+
+      const newRow: GiveawayRow = {
+        id: crypto.randomUUID(),
+        amount_per_user: Math.trunc(amountPerUser),
+        max_winners: Math.trunc(maxWinners),
+        claimed_count: 0,
+        scheduled_at: new Date(rawSched).toISOString(),
+        status: isLiveNow ? 'live' : 'scheduled',
+        created_by: me.id,
+        created_at: new Date().toISOString(),
+      };
+
+      const { data: inserted, error: insErr } = await sb
+        .from('giveaways')
+        .insert(newRow)
+        .select('*')
+        .maybeSingle();
+
+      let saved = inserted as GiveawayRow | null;
+      if (insErr) {
+        if (!isMissingRelationError(insErr)) throw insErr;
+        const fb = readOwnerPanelFallback();
+        fb.giveaways.unshift(newRow);
+        writeOwnerPanelFallback(fb);
+        saved = newRow;
+      }
+
+      broadcastToAll('owner_panel:updated', {
+        reason: 'giveaway_created',
+        id: saved?.id || newRow.id,
+      });
+
+      return res.json({
+        giveaway: {
+          ...(saved || newRow),
+          claimed_by_me: false,
+          claims: [],
+        },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal membuat event bagi-bagi coin' });
+    }
+  });
+
+  app.patch('/api/owner/giveaways/:id/cancel', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat membatalkan event' });
+      }
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'ID event tidak valid' });
+
+      const { data: updated, error: updErr } = await sb
+        .from('giveaways')
+        .update({ status: 'cancelled' })
+        .eq('id', id)
+        .select('*')
+        .maybeSingle();
+
+      if (updErr) {
+        if (!isMissingRelationError(updErr)) throw updErr;
+        const fb = readOwnerPanelFallback();
+        fb.giveaways = fb.giveaways.map((g) => (g.id === id ? { ...g, status: 'cancelled' } : g));
+        writeOwnerPanelFallback(fb);
+      }
+
+      broadcastToAll('owner_panel:updated', { reason: 'giveaway_cancelled', id });
+      return res.json({ ok: true, giveaway: updated || null });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal membatalkan event' });
+    }
+  });
+
+  app.delete('/api/owner/giveaways/:id', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat menghapus event' });
+      }
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'ID event tidak valid' });
+
+      const { error: delClaimErr } = await sb.from('giveaway_claims').delete().eq('giveaway_id', id);
+      const { error: delErr } = await sb.from('giveaways').delete().eq('id', id);
+
+      if (delErr || delClaimErr) {
+        const errToCheck = delErr || delClaimErr;
+        if (!isMissingRelationError(errToCheck)) throw errToCheck;
+        const fb = readOwnerPanelFallback();
+        fb.giveaways = fb.giveaways.filter((g) => g.id !== id);
+        fb.claims = fb.claims.filter((c) => c.giveaway_id !== id);
+        writeOwnerPanelFallback(fb);
+      }
+
+      broadcastToAll('owner_panel:updated', { reason: 'giveaway_deleted', id });
+      return res.json({ ok: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal menghapus event bagi-bagi coin' });
+    }
+  });
+
+  app.post('/api/giveaways/:id/claim', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    const giveawayId = String(req.params.id || '').trim();
+    if (!giveawayId) return res.status(400).json({ error: 'ID bagi-bagi coin tidak valid' });
+
+    try {
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (isUnlimitedOwner(me)) {
+        return res.status(400).json({ error: 'Akun Owner tidak mengambil kuota member' });
+      }
+
+      const result = await withDropLock(giveawayId, async () => {
+        const { giveaways, claims } = await fetchAllGiveaways(sb);
+        const giveaway = giveaways.find((g) => g.id === giveawayId);
+        if (!giveaway) {
+          return { status: 404, body: { error: 'Event bagi-bagi coin tidak ditemukan' } };
+        }
+        if (giveaway.status === 'cancelled') {
+          return { status: 400, body: { error: 'Event bagi-bagi coin telah dibatalkan' } };
+        }
+
+        const nowMs = Date.now();
+        const schedMs = new Date(giveaway.scheduled_at).getTime();
+        if (Number.isFinite(schedMs) && nowMs < schedMs) {
+          return {
+            status: 400,
+            body: { error: 'Belum waktunya klaim! Tunggu sampai jam WIB yang ditentukan.' },
+          };
+        }
+
+        // Duplicate claim check directly against database claims
+        const { data: existingDbClaim, error: dupErr } = await sb
+          .from('giveaway_claims')
+          .select('id')
+          .eq('giveaway_id', giveawayId)
+          .eq('user_id', me.id)
+          .maybeSingle();
+
+        if (dupErr && !isMissingRelationError(dupErr)) throw dupErr;
+        const gClaims = claims.filter((c) => c.giveaway_id === giveawayId);
+        if (existingDbClaim || gClaims.some((c) => c.user_id === me.id)) {
+          return { status: 400, body: { error: 'Sudah Diklaim! Kamu hanya bisa klaim 1 kali per event.' } };
+        }
+
+        const currentClaimed = Math.max(giveaway.claimed_count || 0, gClaims.length);
+        if (giveaway.status === 'ended' || currentClaimed >= giveaway.max_winners) {
+          return { status: 400, body: { error: 'Slot Habis! Kuota bagi-bagi coin sudah penuh.' } };
+        }
+
+        const newClaim: GiveawayClaimRow = {
+          id: crypto.randomUUID(),
+          giveaway_id: giveawayId,
+          user_id: me.id,
+          amount: giveaway.amount_per_user,
+          claimed_at: new Date().toISOString(),
+        };
+
+        const { error: claimInsErr } = await sb.from('giveaway_claims').insert(newClaim);
+        if (claimInsErr) {
+          if (isMissingRelationError(claimInsErr)) {
+            const fb = readOwnerPanelFallback();
+            const fbClaims = fb.claims.filter((c) => c.giveaway_id === giveawayId);
+            if (fbClaims.some((c) => c.user_id === me.id)) {
+              return { status: 400, body: { error: 'Sudah Diklaim! Kamu hanya bisa klaim 1 kali per event.' } };
+            }
+            if (fbClaims.length >= giveaway.max_winners) {
+              return { status: 400, body: { error: 'Slot Habis! Kuota bagi-bagi coin sudah penuh.' } };
+            }
+            fb.claims.unshift(newClaim);
+            fb.giveaways = fb.giveaways.map((g) => {
+              if (g.id !== giveawayId) return g;
+              const nextCount = fbClaims.length + 1;
+              return {
+                ...g,
+                claimed_count: nextCount,
+                status: nextCount >= g.max_winners ? 'ended' : 'live',
+              };
+            });
+            writeOwnerPanelFallback(fb);
+          } else if (String(claimInsErr.code || '') === '23505') {
+            return { status: 400, body: { error: 'Sudah Diklaim! Kamu hanya bisa klaim 1 kali per event.' } };
+          } else {
+            throw claimInsErr;
+          }
+        } else {
+          const nextCount = currentClaimed + 1;
+          await sb
+            .from('giveaways')
+            .update({
+              claimed_count: nextCount,
+              status: nextCount >= giveaway.max_winners ? 'ended' : 'live',
+            })
+            .eq('id', giveawayId);
+        }
+
+        const { data: freshPlayer, error: pErr } = await sb
+          .from('players')
+          .select('*')
+          .eq('id', me.id)
+          .maybeSingle();
+        if (pErr || !freshPlayer) {
+          throw pErr || new Error('Akun tidak ditemukan');
+        }
+
+        const nextCoins = resolveRowBalance(freshPlayer) + Number(giveaway.amount_per_user);
+        const updatedPlayer = await updatePlayerCoinsAndBalance(sb, me.id, nextCoins);
+        if (!updatedPlayer) {
+          throw new Error('Gagal menambahkan coin');
+        }
+
+        await syncProfilesTable(sb, updatedPlayer);
+
+        const { data: ownerPlayerRow } = await sb
+          .from('players')
+          .select('*')
+          .or(`telegram_id.eq.${OWNER_TELEGRAM_ID},username.ilike.afz`)
+          .limit(1)
+          .maybeSingle();
+
+        await recordTransferTransaction(sb, {
+          senderId: ownerPlayerRow?.id || me.id,
+          recipientId: me.id,
+          amount: giveaway.amount_per_user,
+          senderUsername: ownerPlayerRow?.username || 'afz',
+          recipientUsername: me.username,
+          txType: 'giveaway',
+          note: `Bagi-Bagi Coin (+${formatCoinsId(giveaway.amount_per_user)} coin)`,
+        });
+
+        const notifMessage = `Kamu mendapat ${formatCoinsId(giveaway.amount_per_user)} coin dari Bagi-Bagi Coin Owner!`;
+        const notif = await insertNotificationSafe(sb, {
+          toPlayerId: me.id,
+          fromPlayerId: ownerPlayerRow?.id || null,
+          type: 'coin_drop',
+          title: 'Terima Coin',
+          message: notifMessage,
+        });
+
+        if (notif) {
+          broadcastToPlayer(me.id, 'notification:new', {
+            ...notif,
+            title: notif.title || 'Terima Coin',
+            message: notif.message || notifMessage,
+            from_player: ownerPlayerRow ? normalizePlayer(ownerPlayerRow) : null,
+          });
+        }
+        broadcastToPlayer(me.id, 'coin:transfer_received', {
+          amount: giveaway.amount_per_user,
+          from_player: ownerPlayerRow ? normalizePlayer(ownerPlayerRow) : null,
+          new_coins: nextCoins,
+          notification_id: notif?.id || null,
+          title: 'Terima Coin',
+          message: notifMessage,
+        });
+        broadcastToAll('owner_panel:updated', {
+          reason: 'giveaway_claimed',
+          giveawayId,
+        });
+
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            amount: giveaway.amount_per_user,
+            newCoins: nextCoins,
+            claimedCount: currentClaimed + 1,
+          },
+        };
+      });
+
+      return res.status(result.status).json(result.body);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Gagal klaim bagi-bagi coin' });
+    }
+  });
+
   async function handleTelegramLogin(
     sb: SupabaseClient,
     initData: string,
     rawUserInput: any
   ): Promise<{ status: number; body: Record<string, any> }> {
-    const caps = await detectAuthSchemaCaps(sb);
     const rawBotToken = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^['"]|['"]$/g, '').trim();
     const hasValidBotToken = /^\d+:[A-Za-z0-9_-]{20,}$/.test(rawBotToken);
     let tgUser = rawUserInput || (initData ? parseTelegramUserFromInitData(initData) : undefined);
@@ -1186,12 +2291,12 @@ async function startServer() {
     const tgFullName = combinedName || resolvedUsername.slice(0, 20);
     let tgPhotoUrl = sanitizeUrl(tgUser?.photo_url);
 
-    const { data: existing, error: selErr } = await sb
-      .from('players')
-      .select('*')
-      .eq('telegram_id', tgId)
-      .maybeSingle();
-    if (selErr) throw selErr;
+    const [caps, existingRes] = await Promise.all([
+      detectAuthSchemaCaps(sb),
+      sb.from('players').select('*').eq('telegram_id', tgId).maybeSingle(),
+    ]);
+    if (existingRes.error) throw existingRes.error;
+    const existing = existingRes.data;
 
     let profileRow: any = null;
     if (caps.hasProfilesTable) {
@@ -1204,12 +2309,23 @@ async function startServer() {
     }
 
     if (!tgPhotoUrl) {
-      tgPhotoUrl =
-        sanitizeUrl(profileRow?.telegram_avatar_url) ||
-        sanitizeUrl(profileRow?.avatar_url) ||
-        null;
-      if (!tgPhotoUrl && !existing?.avatar_url) {
-        tgPhotoUrl = await fetchTelegramAvatarFromBotApi(sb, tgId);
+      const profAv = sanitizeUrl(profileRow?.telegram_avatar_url) || sanitizeUrl(profileRow?.avatar_url);
+      if (profAv && !isMissingLocalUpload(profAv)) {
+        tgPhotoUrl = profAv;
+      } else if (!existing?.avatar_url || isMissingLocalUpload(existing.avatar_url)) {
+        const bgFetch = fetchTelegramAvatarFromBotApi(sb, tgId)
+          .then(async (fetchedUrl) => {
+            if (!fetchedUrl) return null;
+            const bgUpdate: Record<string, any> = { avatar_url: fetchedUrl };
+            if (caps.hasTelegramAvatarCol) bgUpdate.telegram_avatar_url = fetchedUrl;
+            await sb.from('players').update(bgUpdate).eq('telegram_id', tgId);
+            return fetchedUrl;
+          })
+          .catch(() => null);
+        tgPhotoUrl = await Promise.race([
+          bgFetch,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 650)),
+        ]);
       }
     }
 
@@ -1233,7 +2349,8 @@ async function startServer() {
         }
       }
 
-      const initialAvatar = sanitizeUrl(profileRow?.avatar_url) || tgPhotoUrl;
+      const rawProfAv = sanitizeUrl(profileRow?.avatar_url);
+      const initialAvatar = (rawProfAv && !isMissingLocalUpload(rawProfAv) ? rawProfAv : null) || tgPhotoUrl;
       const initialName =
         (typeof profileRow?.full_name === 'string' && profileRow.full_name.trim())
           ? profileRow.full_name.trim().slice(0, 20)
@@ -1247,8 +2364,10 @@ async function startServer() {
         avatar_url: initialAvatar,
         bio: initialBio,
         is_owner: isOwner,
+        role: isOwner ? 'owner' : 'user',
         is_banned: false,
         coins: isOwner ? OWNER_COINS : 500,
+        balance: isOwner ? OWNER_COINS : 500,
         border_id: isOwner ? OWNER_BORDER : null,
       };
       if (caps.hasTelegramAvatarCol) {
@@ -1275,9 +2394,9 @@ async function startServer() {
         activeRow = inserted;
       }
     } else {
-      // Existing user: DO NOT overwrite custom full_name, custom avatar_url, or bio!
-      // ONLY sync username automatically if changed in Telegram, populate avatar_url if still empty,
-      // keep telegram_avatar_url updated, and enforce owner flag by telegram_id.
+      // Existing user: preserve custom name, custom avatar_url, and bio!
+      // Sync Telegram username if Telegram account has username; repair missing/broken local upload avatars;
+      // strictly enforce is_owner and role by telegram_id.
       const updates: Record<string, any> = {};
 
       if (rawTgUsername && rawTgUsername !== existing.username) {
@@ -1300,32 +2419,43 @@ async function startServer() {
         }
       }
 
+      const rawProfAv = sanitizeUrl(profileRow?.avatar_url) || sanitizeUrl(profileRow?.telegram_avatar_url);
       const hydratedAvatar =
-        tgPhotoUrl ||
-        sanitizeUrl(profileRow?.avatar_url) ||
-        sanitizeUrl(profileRow?.telegram_avatar_url);
-      if (!existing.avatar_url && hydratedAvatar) {
+        tgPhotoUrl || (rawProfAv && !isMissingLocalUpload(rawProfAv) ? rawProfAv : null);
+      if ((!existing.avatar_url || isMissingLocalUpload(existing.avatar_url)) && hydratedAvatar) {
         updates.avatar_url = hydratedAvatar;
+      } else if (isMissingLocalUpload(existing.avatar_url) && !hydratedAvatar) {
+        updates.avatar_url = null;
       }
       if (!existing.bio && typeof profileRow?.bio === 'string' && profileRow.bio.trim()) {
         updates.bio = profileRow.bio;
       }
-      if (
-        (!existing.name || existing.name === 'Pengguna') &&
-        typeof profileRow?.full_name === 'string' &&
-        profileRow.full_name.trim()
-      ) {
-        updates.name = profileRow.full_name.trim().slice(0, 20);
+      const existingNameTrimmed = String(existing.name || '').trim();
+      if (!existingNameTrimmed || existingNameTrimmed === 'Pengguna' || /^tg_\d+$/.test(existingNameTrimmed)) {
+        const fallbackProfName =
+          typeof profileRow?.full_name === 'string' && profileRow.full_name.trim()
+            ? profileRow.full_name.trim().slice(0, 20)
+            : '';
+        updates.name = fallbackProfName || tgFullName;
       }
 
       if (tgPhotoUrl && caps.hasTelegramAvatarCol && existing.telegram_avatar_url !== tgPhotoUrl) {
         updates.telegram_avatar_url = tgPhotoUrl;
       }
-      if (isOwner && (!existing.is_owner || Number(existing.coins) !== OWNER_COINS)) {
+      if (
+        isOwner &&
+        (!existing.is_owner ||
+          String(existing.role || '').toLowerCase() !== 'owner' ||
+          Number(existing.coins) !== OWNER_COINS ||
+          Number(existing.balance) !== OWNER_COINS)
+      ) {
         updates.is_owner = true;
+        updates.role = 'owner';
         updates.coins = OWNER_COINS;
-      } else if (!isOwner && existing.is_owner) {
+        updates.balance = OWNER_COINS;
+      } else if (!isOwner && (existing.is_owner || String(existing.role || '').toLowerCase() === 'owner')) {
         updates.is_owner = false;
+        updates.role = 'user';
       }
 
       if (Object.keys(updates).length > 0) {
@@ -1340,22 +2470,23 @@ async function startServer() {
       }
     }
 
+    const hasTgUsername = Boolean(rawTgUsername);
     if (tgPhotoUrl && activeRow?.id) {
       telegramAvatarMemoryCache.set(String(activeRow.id), tgPhotoUrl);
     }
     if (activeRow?.id) {
-      telegramHasUsernameCache.set(String(activeRow.id), Boolean(rawTgUsername));
+      telegramHasUsernameCache.set(String(activeRow.id), hasTgUsername);
     }
 
     const normalizedRow = normalizePlayer(activeRow);
-    await syncProfilesTable(sb, normalizedRow);
+    void syncProfilesTable(sb, normalizedRow);
 
     const [enriched, ownerState, playersRes] = await Promise.all([
       enrichPlayerStats(sb, normalizedRow, normalizedRow.id),
       resolveOwnerAndFollowStatus(sb, normalizedRow),
       sb
         .from('players')
-        .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
+        .select('id, telegram_id, name, username, avatar_url, is_owner, role, border_id, coins, balance')
         .eq('is_banned', false)
         .order('is_owner', { ascending: false })
         .order('created_at', { ascending: true })
@@ -1367,10 +2498,10 @@ async function startServer() {
       body: {
         player: {
           ...enriched,
-          has_telegram_username: Boolean(rawTgUsername),
+          has_telegram_username: hasTgUsername,
           follows_owner: ownerState.followsOwner,
         },
-        sessionToken: signSessionToken(normalizedRow.id),
+        sessionToken: signSessionToken(normalizedRow.id, hasTgUsername),
         players: (playersRes.data || []).map((p) => normalizePlayer(p)),
         ownerPlayer: ownerState.ownerPlayer,
       },
@@ -1425,7 +2556,7 @@ async function startServer() {
     }
   });
 
-  // Auth / Me (auto-loads active session or Owner fallback in browser preview)
+  // Auth / Me (loads verified active session; ONLY falls back to Owner in AI Studio preview without x-no-owner-fallback)
   app.get('/api/auth/me', async (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store');
     const sb = getSupabase();
@@ -1442,7 +2573,7 @@ async function startServer() {
         resolveOwnerAndFollowStatus(sb, player),
         sb
           .from('players')
-          .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
+          .select('id, telegram_id, name, username, avatar_url, is_owner, role, border_id, coins, balance')
           .eq('is_banned', false)
           .order('is_owner', { ascending: false })
           .order('created_at', { ascending: true })
@@ -1453,12 +2584,16 @@ async function startServer() {
           ...enriched,
           follows_owner: ownerState.followsOwner,
         },
-        sessionToken: signSessionToken(player.id),
+        sessionToken: signSessionToken(player.id, enriched.has_telegram_username),
         players: (playersRes.data || []).map((p) => normalizePlayer(p)),
         ownerPlayer: ownerState.ownerPlayer,
       });
     } catch (err: any) {
-      return res.status(500).json({ error: err?.message || 'Gagal memuat akun' });
+      const status = typeof err?.status === 'number' ? err.status : 500;
+      return res.status(status).json({
+        error: err?.code || err?.message || 'Gagal memuat akun',
+        message: err?.message || 'Gagal memuat akun',
+      });
     }
   });
 
@@ -1505,6 +2640,11 @@ async function startServer() {
         if (cleanedUsername.length < 3) {
           return res.status(400).json({
             error: 'Username minimal 3 karakter (huruf, angka, atau _)',
+          });
+        }
+        if (!me.is_owner && (cleanedUsername === 'afz' || cleanedUsername === 'istamina')) {
+          return res.status(400).json({
+            error: 'Username tersebut khusus Owner dan tidak dapat digunakan',
           });
         }
         const { data: existingUsername } = await sb
@@ -3398,27 +4538,37 @@ async function startServer() {
     }
   });
 
-  // Notifications
+  // Notifications (supports both user_id & to_player_id + title & message columns)
   app.get('/api/notifications', async (req: Request, res: Response) => {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const me = await ensureOwnerAndResolvePlayer(sb, req);
-      const { data: rows, error } = await sb
+      let { data: rows, error } = await sb
         .from('notifications')
         .select('*')
-        .eq('to_player_id', me.id)
+        .or(`user_id.eq.${me.id},to_player_id.eq.${me.id}`)
         .order('created_at', { ascending: false })
         .limit(80);
+      if (error && /column|schema cache|PGRST204/i.test(String(error.message || ''))) {
+        const retry = await sb
+          .from('notifications')
+          .select('*')
+          .eq('to_player_id', me.id)
+          .order('created_at', { ascending: false })
+          .limit(80);
+        rows = retry.data;
+        error = retry.error;
+      }
       if (error) throw error;
 
-      const fromIds = (rows || []).map((n) => n.from_player_id).filter(Boolean);
+      const fromIds = (rows || []).map((n: any) => n.from_player_id).filter(Boolean);
       const pMap = await getPlayersMap(sb, fromIds);
-      const notifications = (rows || []).map((n) => ({
+      const notifications = (rows || []).map((n: any) => ({
         ...n,
         from_player: n.from_player_id ? pMap.get(n.from_player_id) || null : null,
       }));
-      const unreadCount = notifications.filter((n) => !n.is_read).length;
+      const unreadCount = notifications.filter((n: any) => !n.is_read).length;
       return res.json({ notifications, unreadCount });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memuat notifikasi' });
@@ -3430,7 +4580,18 @@ async function startServer() {
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const me = await ensureOwnerAndResolvePlayer(sb, req);
-      await sb.from('notifications').update({ is_read: true }).eq('to_player_id', me.id).eq('is_read', false);
+      const { error } = await sb
+        .from('notifications')
+        .update({ is_read: true })
+        .or(`user_id.eq.${me.id},to_player_id.eq.${me.id}`)
+        .eq('is_read', false);
+      if (error && /column|schema cache|PGRST204/i.test(String(error.message || ''))) {
+        await sb
+          .from('notifications')
+          .update({ is_read: true })
+          .eq('to_player_id', me.id)
+          .eq('is_read', false);
+      }
       return res.json({ ok: true });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal menandai notifikasi' });
@@ -3444,11 +4605,18 @@ async function startServer() {
       const me = await ensureOwnerAndResolvePlayer(sb, req);
       const notifId = req.params.id;
       if (!isUuid(notifId)) return res.status(400).json({ error: 'ID tidak valid' });
-      await sb
+      const { error } = await sb
         .from('notifications')
         .update({ is_read: true })
         .eq('id', notifId)
-        .eq('to_player_id', me.id);
+        .or(`user_id.eq.${me.id},to_player_id.eq.${me.id}`);
+      if (error && /column|schema cache|PGRST204/i.test(String(error.message || ''))) {
+        await sb
+          .from('notifications')
+          .update({ is_read: true })
+          .eq('id', notifId)
+          .eq('to_player_id', me.id);
+      }
       return res.json({ ok: true });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal menandai notifikasi' });
@@ -3491,6 +4659,27 @@ async function startServer() {
       });
     }
   });
+
+  // Supabase Realtime bridge (forwards direct DB changes to connected WS clients)
+  const sbRealtime = getSupabase();
+  if (sbRealtime) {
+    try {
+      sbRealtime
+        .channel('nz-server-db-realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'broadcasts' }, () => {
+          broadcastToAll('owner_panel:updated', { reason: 'supabase_realtime_broadcast' });
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'giveaways' }, () => {
+          broadcastToAll('owner_panel:updated', { reason: 'supabase_realtime_giveaway' });
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'giveaway_claims' }, () => {
+          broadcastToAll('owner_panel:updated', { reason: 'supabase_realtime_claim' });
+        })
+        .subscribe();
+    } catch {
+      // Non-fatal if Realtime replication isn't enabled on server client
+    }
+  }
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Nongkrong Zone server listening on http://0.0.0.0:${PORT}`);

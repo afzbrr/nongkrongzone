@@ -27,6 +27,13 @@ const AvatarComponent: React.FC<AvatarProps> = ({
 }) => {
   const { bordersById } = useBorders();
   const safeSrc = sanitizeMediaUrl(player?.avatar_url);
+  const [imgError, setImgError] = React.useState(false);
+
+  React.useEffect(() => {
+    setImgError(false);
+  }, [safeSrc]);
+
+  const showImg = Boolean(safeSrc && !imgError);
   const isOwner = Boolean(player?.is_owner);
   const playerBorderId = player?.border_id;
 
@@ -125,11 +132,12 @@ const AvatarComponent: React.FC<AvatarProps> = ({
         visual.isGlitch && !useStoryRing ? 'nz-glitch' : ''
       }`}
     >
-      {safeSrc ? (
+      {showImg ? (
         <img
-          src={safeSrc}
+          src={safeSrc!}
           alt={player?.name || 'Avatar'}
           referrerPolicy="no-referrer"
+          onError={() => setImgError(true)}
           className="w-full h-full object-cover"
         />
       ) : (

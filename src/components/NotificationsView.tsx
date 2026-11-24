@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowLeft, Bell, CheckCheck } from 'lucide-react';
+import { ArrowLeft, Bell, CheckCheck, Coins } from 'lucide-react';
 import type { NotificationItem } from '../types';
 import { formatRelativeTime } from '../utils/format';
 import { Avatar } from './Avatar';
@@ -82,11 +82,40 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
                   background: !n.is_read ? 'var(--nz-card)' : 'transparent',
                 }}
               >
-                <Avatar player={n.from_player} size={36} />
+                <div className="relative shrink-0">
+                  <Avatar player={n.from_player} size={36} />
+                  {(n.type === 'transfer' ||
+                    n.type === 'coin_drop' ||
+                    n.title === 'Terima Coin') && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute -bottom-1 -right-1 w-4 h-4 rounded-full bg-[#111111] border border-[#FACC15] flex items-center justify-center"
+                    >
+                      <Coins className="w-2.5 h-2.5 text-[#FACC15]" strokeWidth={2.2} />
+                    </span>
+                  )}
+                </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-[13px] leading-[1.45]" style={{ color: 'var(--nz-text-body)' }}>
-                    {n.title}
-                  </p>
+                  {n.message ? (
+                    <>
+                      <p
+                        className="text-[13px] font-semibold leading-[1.35]"
+                        style={{ color: 'var(--nz-text)' }}
+                      >
+                        {n.title}
+                      </p>
+                      <p
+                        className="text-[12.5px] leading-[1.4] mt-0.5"
+                        style={{ color: 'var(--nz-text-body)' }}
+                      >
+                        {n.message}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-[13px] leading-[1.45]" style={{ color: 'var(--nz-text-body)' }}>
+                      {n.title}
+                    </p>
+                  )}
                   <span
                     className="text-[11px] uppercase mt-0.5 block"
                     style={{ color: 'var(--nz-text-muted)' }}

@@ -2,8 +2,11 @@ import type {
   BorderItem,
   ChatGroup,
   ConversationItem,
+  Giveaway,
   Message,
   NotificationItem,
+  OwnerBroadcast,
+  OwnerPanelStats,
   Player,
   Post,
   PostComment,
@@ -12,36 +15,17 @@ import type {
   StoryReact,
   StoryView,
 } from '../types';
-import { localStore } from './localFallbackStore';
 
 let activePlayerIdMemory: string | null = null;
 let activeSessionTokenMemory: string | null = null;
-let staticSpaMode = false;
+let noOwnerFallbackMemory = false;
 
 export function isStaticSpaHost(): boolean {
-  return staticSpaMode;
+  return false;
 }
 
-function shouldFallbackToStatic(err: any): boolean {
-  return Boolean(err?.isSpaFallbackHtml || err?.status === 404);
-}
-
-async function withStaticFallback<T>(
-  remoteCall: () => Promise<T>,
-  fallbackCall: () => T | Promise<T>
-): Promise<T> {
-  if (staticSpaMode) {
-    return await fallbackCall();
-  }
-  try {
-    return await remoteCall();
-  } catch (err: any) {
-    if (shouldFallbackToStatic(err)) {
-      staticSpaMode = true;
-      return await fallbackCall();
-    }
-    throw err;
-  }
+export function setNoOwnerFallback(enabled: boolean) {
+  noOwnerFallbackMemory = enabled;
 }
 
 export function setActivePlayerId(id: string | null) {
@@ -82,6 +66,9 @@ async function apiFetch<T>(
     }
     if (activePlayerIdMemory) {
       headers['x-player-id'] = activePlayerIdMemory;
+    }
+    if (noOwnerFallbackMemory) {
+      headers['x-no-owner-fallback'] = '1';
     }
 
     const controller = new AbortController();
@@ -181,168 +168,122 @@ export async function uploadMediaFile(file: File): Promise<{ url: string; mediaT
     reader.onerror = () => reject(new Error('Gagal membaca file'));
     reader.readAsDataURL(file);
   });
-  return withStaticFallback(
-    () =>
-      apiFetch<{ url: string; mediaType: string }>(
-        '/api/upload',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            filename: file.name,
-            mimeType: file.type,
-            dataBase64,
-          }),
-        },
-        60000
-      ),
-    () => ({
-      url: dataBase64,
-      mediaType: file.type.startsWith('video/') ? 'video' : 'image',
-    })
+  return apiFetch<{ url: string; mediaType: string }>(
+    '/api/upload',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        filename: file.name,
+        mimeType: file.type,
+        dataBase64,
+      }),
+    },
+    60000
   );
 }
 
 export const api = {
   health: () =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; supabaseConfigured: boolean; missing: string[] }>('/api/health', {
-          cache: 'no-store',
-        }),
-      () => ({ ok: true, supabaseConfigured: true, missing: [] })
+    apiFetch<{ ok: boolean; supabaseConfigured: boolean; missing: string[] }>('/api/health', {
+      cache: 'no-store',
+    }),
+
+  telegramLogin: (payload: { initData?: string; user?: TelegramWebAppUser }) =>
+    apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>(
+      '/api/auth/telegram',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      20000
     ),
 
-  telegramLogin: (payload: { initData?: string; user: TelegramWebAppUser }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>('/api/auth/telegram', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        }),
-      () => localStore.telegramLogin(payload.user, activePlayerIdMemory)
-    ),
-
-  telegramLoginGet: (payload: { initData?: string; user: TelegramWebAppUser }) => {
+  telegramLoginGet: (payload: { initData?: string; user?: TelegramWebAppUser }) => {
     const sp = new URLSearchParams();
     if (payload.initData) sp.set('initData', payload.initData);
-    sp.set('tg_id', String(payload.user.id));
-    if (payload.user.username) sp.set('username', payload.user.username);
-    if (payload.user.first_name) sp.set('first_name', payload.user.first_name);
-    if (payload.user.last_name) sp.set('last_name', payload.user.last_name);
-    if (payload.user.photo_url) sp.set('photo_url', payload.user.photo_url);
-    return withStaticFallback(
-      () =>
-        apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>(
-          `/api/auth/telegram-login?${sp.toString()}`,
-          { cache: 'no-store' }
-        ),
-      () => localStore.telegramLogin(payload.user, activePlayerIdMemory)
+    if (payload.user?.id) {
+      sp.set('tg_id', String(payload.user.id));
+      if (payload.user.username) sp.set('username', payload.user.username);
+      if (payload.user.first_name) sp.set('first_name', payload.user.first_name);
+      if (payload.user.last_name) sp.set('last_name', payload.user.last_name);
+      if (payload.user.photo_url) sp.set('photo_url', payload.user.photo_url);
+    }
+    return apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>(
+      `/api/auth/telegram-login?${sp.toString()}`,
+      { cache: 'no-store' },
+      20000
     );
   },
 
   getMe: () =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ player: Player; sessionToken?: string; players: Player[]; ownerPlayer?: Player | null }>('/api/auth/me', {
-          cache: 'no-store',
-        }),
-      () => localStore.getMe(activePlayerIdMemory)
+    apiFetch<{ player: Player; sessionToken?: string; players: Player[]; ownerPlayer?: Player | null }>(
+      '/api/auth/me',
+      {
+        cache: 'no-store',
+      }
     ),
 
-  updateMe: (payload: { full_name?: string; name?: string; username?: string; bio?: string; avatar_url?: string | null }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ player: Player }>('/api/players/me', {
-          method: 'PATCH',
-          body: JSON.stringify({
-            ...(payload.full_name !== undefined ? { full_name: payload.full_name } : {}),
-            ...(payload.name !== undefined ? { name: payload.name } : {}),
-            ...(payload.username !== undefined ? { username: payload.username } : {}),
-            ...(payload.bio !== undefined ? { bio: payload.bio } : {}),
-            ...(payload.avatar_url !== undefined ? { avatar_url: payload.avatar_url } : {}),
-          }),
-        }),
-      () => localStore.updateMe(payload, activePlayerIdMemory)
-    ),
+  updateMe: (payload: {
+    full_name?: string;
+    name?: string;
+    username?: string;
+    bio?: string;
+    avatar_url?: string | null;
+  }) =>
+    apiFetch<{ player: Player }>('/api/players/me', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        ...(payload.full_name !== undefined ? { full_name: payload.full_name } : {}),
+        ...(payload.name !== undefined ? { name: payload.name } : {}),
+        ...(payload.username !== undefined ? { username: payload.username } : {}),
+        ...(payload.bio !== undefined ? { bio: payload.bio } : {}),
+        ...(payload.avatar_url !== undefined ? { avatar_url: payload.avatar_url } : {}),
+      }),
+    }),
 
   getPlayers: (q = '') =>
-    withStaticFallback(
-      () => apiFetch<{ players: Player[] }>(`/api/players${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-      () => localStore.getPlayers(q, activePlayerIdMemory)
-    ),
+    apiFetch<{ players: Player[] }>(`/api/players${q ? `?q=${encodeURIComponent(q)}` : ''}`),
 
   getPlayerProfile: (identifier: string) =>
-    withStaticFallback(
-      () => apiFetch<{ player: Player }>(`/api/players/${encodeURIComponent(identifier)}`),
-      () => localStore.getPlayerProfile(identifier, activePlayerIdMemory)
-    ),
+    apiFetch<{ player: Player }>(`/api/players/${encodeURIComponent(identifier)}`),
 
   getFollowers: (playerId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ players: Player[] }>(`/api/players/${playerId}/followers`),
-      () => localStore.getFollowers(playerId, activePlayerIdMemory)
-    ),
+    apiFetch<{ players: Player[] }>(`/api/players/${playerId}/followers`),
 
   getFollowing: (playerId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ players: Player[] }>(`/api/players/${playerId}/following`),
-      () => localStore.getFollowing(playerId, activePlayerIdMemory)
-    ),
+    apiFetch<{ players: Player[] }>(`/api/players/${playerId}/following`),
 
-  getBlockedPlayers: () =>
-    withStaticFallback(
-      () => apiFetch<{ players: Player[] }>('/api/players/me/blocked'),
-      () => localStore.getBlockedPlayers(activePlayerIdMemory)
-    ),
+  getBlockedPlayers: () => apiFetch<{ players: Player[] }>('/api/players/me/blocked'),
 
   follow: (target_player_id: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/follows', {
-          method: 'POST',
-          body: JSON.stringify({ target_player_id }),
-        }),
-      () => localStore.follow(target_player_id, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/follows', {
+      method: 'POST',
+      body: JSON.stringify({ target_player_id }),
+    }),
 
   unfollow: (targetId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean; follows_owner?: boolean }>(`/api/follows/${targetId}`, { method: 'DELETE' }),
-      () => localStore.unfollow(targetId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean; follows_owner?: boolean }>(`/api/follows/${targetId}`, {
+      method: 'DELETE',
+    }),
 
   block: (target_player_id: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/blocks', {
-          method: 'POST',
-          body: JSON.stringify({ target_player_id }),
-        }),
-      () => localStore.block(target_player_id, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/blocks', {
+      method: 'POST',
+      body: JSON.stringify({ target_player_id }),
+    }),
 
   unblock: (targetId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/blocks/${targetId}`, { method: 'DELETE' }),
-      () => localStore.unblock(targetId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/blocks/${targetId}`, { method: 'DELETE' }),
 
   getPosts: (params?: { playerId?: string; q?: string }) => {
     const sp = new URLSearchParams();
     if (params?.playerId) sp.set('playerId', params.playerId);
     if (params?.q) sp.set('q', params.q);
     const qs = sp.toString();
-    return withStaticFallback(
-      () => apiFetch<{ posts: Post[] }>(`/api/posts${qs ? `?${qs}` : ''}`),
-      () => localStore.getPosts(params, activePlayerIdMemory)
-    );
+    return apiFetch<{ posts: Post[] }>(`/api/posts${qs ? `?${qs}` : ''}`);
   },
 
-  getPost: (postId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ post: Post | null }>(`/api/posts/${postId}`),
-      () => localStore.getPost(postId, activePlayerIdMemory)
-    ),
+  getPost: (postId: string) => apiFetch<{ post: Post | null }>(`/api/posts/${postId}`),
 
   createPost: (payload: {
     caption?: string;
@@ -352,66 +293,37 @@ export const api = {
     original_post_id?: string | null;
     repost_caption?: string | null;
   }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ post: Post }>('/api/posts', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        }),
-      () => localStore.createPost(payload, activePlayerIdMemory)
-    ),
+    apiFetch<{ post: Post }>('/api/posts', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   deletePost: (postId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/posts/${postId}`, { method: 'DELETE' }),
-      () => localStore.deletePost(postId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/posts/${postId}`, { method: 'DELETE' }),
 
   togglePostLike: (postId: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ liked: boolean; likes_count: number }>(`/api/posts/${postId}/like`, {
-          method: 'POST',
-        }),
-      () => localStore.togglePostLike(postId, activePlayerIdMemory)
-    ),
+    apiFetch<{ liked: boolean; likes_count: number }>(`/api/posts/${postId}/like`, {
+      method: 'POST',
+    }),
 
   getComments: (postId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ comments: PostComment[] }>(`/api/posts/${postId}/comments`),
-      () => localStore.getComments(postId, activePlayerIdMemory)
-    ),
+    apiFetch<{ comments: PostComment[] }>(`/api/posts/${postId}/comments`),
 
   addComment: (postId: string, text: string, parent_comment_id?: string | null) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ comment: PostComment; comments_count: number }>(`/api/posts/${postId}/comments`, {
-          method: 'POST',
-          body: JSON.stringify({ text, parent_comment_id: parent_comment_id || null }),
-        }),
-      () => localStore.addComment(postId, text, parent_comment_id, activePlayerIdMemory)
-    ),
+    apiFetch<{ comment: PostComment; comments_count: number }>(`/api/posts/${postId}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ text, parent_comment_id: parent_comment_id || null }),
+    }),
 
   toggleCommentLike: (commentId: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ liked: boolean; likes_count: number }>(`/api/comments/${commentId}/like`, {
-          method: 'POST',
-        }),
-      () => localStore.toggleCommentLike(commentId, activePlayerIdMemory)
-    ),
+    apiFetch<{ liked: boolean; likes_count: number }>(`/api/comments/${commentId}/like`, {
+      method: 'POST',
+    }),
 
   deleteComment: (commentId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/comments/${commentId}`, { method: 'DELETE' }),
-      () => localStore.deleteComment(commentId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/comments/${commentId}`, { method: 'DELETE' }),
 
-  getStories: () =>
-    withStaticFallback(
-      () => apiFetch<{ storyGroups: StoryGroup[] }>('/api/stories'),
-      () => localStore.getStories(activePlayerIdMemory)
-    ),
+  getStories: () => apiFetch<{ storyGroups: StoryGroup[] }>('/api/stories'),
 
   createStory: (payload: {
     media_url?: string | null;
@@ -424,96 +336,55 @@ export const api = {
     song_artist?: string;
     song_url?: string;
   }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ story: Story }>('/api/stories', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        }),
-      () => localStore.createStory(payload, activePlayerIdMemory)
-    ),
+    apiFetch<{ story: Story }>('/api/stories', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   deleteStory: (storyId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/stories/${storyId}`, { method: 'DELETE' }),
-      () => localStore.deleteStory(storyId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/stories/${storyId}`, { method: 'DELETE' }),
 
   viewStory: (storyId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/stories/${storyId}/view`, { method: 'POST' }),
-      () => localStore.viewStory(storyId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/stories/${storyId}/view`, { method: 'POST' }),
 
   getStoryViews: (storyId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ viewers: StoryView[]; reacts: StoryReact[] }>(`/api/stories/${storyId}/views`),
-      () => localStore.getStoryViews(storyId)
-    ),
+    apiFetch<{ viewers: StoryView[]; reacts: StoryReact[] }>(`/api/stories/${storyId}/views`),
 
   reactStory: (storyId: string, emoji: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ react: StoryReact }>(`/api/stories/${storyId}/react`, {
-          method: 'POST',
-          body: JSON.stringify({ emoji }),
-        }),
-      () => localStore.reactStory(storyId, emoji, activePlayerIdMemory)
-    ),
+    apiFetch<{ react: StoryReact }>(`/api/stories/${storyId}/react`, {
+      method: 'POST',
+      body: JSON.stringify({ emoji }),
+    }),
 
   replyStory: (storyId: string, text: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ message: Message; peer_id: string }>(`/api/stories/${storyId}/reply`, {
-          method: 'POST',
-          body: JSON.stringify({ text }),
-        }),
-      () => localStore.replyStory(storyId, text, activePlayerIdMemory)
-    ),
+    apiFetch<{ message: Message; peer_id: string }>(`/api/stories/${storyId}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
 
   getConversations: () =>
-    withStaticFallback(
-      () => apiFetch<{ conversations: ConversationItem[] }>('/api/chat/conversations'),
-      () => localStore.getConversations(activePlayerIdMemory)
-    ),
+    apiFetch<{ conversations: ConversationItem[] }>('/api/chat/conversations'),
 
   getDmMessages: (peerId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ peer: Player; messages: Message[]; blocked: boolean }>(`/api/chat/dm/${peerId}`),
-      () => localStore.getDmMessages(peerId, activePlayerIdMemory)
-    ),
+    apiFetch<{ peer: Player; messages: Message[]; blocked: boolean }>(`/api/chat/dm/${peerId}`),
 
   markDmRead: (peerId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/chat/dm/${peerId}/read`, { method: 'POST' }),
-      () => localStore.markDmRead(peerId, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/chat/dm/${peerId}/read`, { method: 'POST' }),
 
   getGroupMessages: (groupId: string) =>
-    withStaticFallback(
-      () => apiFetch<{ group: ChatGroup; messages: Message[] }>(`/api/chat/groups/${groupId}`),
-      () => localStore.getGroupMessages(groupId)
-    ),
+    apiFetch<{ group: ChatGroup; messages: Message[] }>(`/api/chat/groups/${groupId}`),
 
   createGroup: (payload: { name: string; avatar_url?: string | null; member_ids: string[] }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ group: ChatGroup }>('/api/chat/groups', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        }),
-      () => localStore.createGroup(payload, activePlayerIdMemory)
-    ),
+    apiFetch<{ group: ChatGroup }>('/api/chat/groups', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   addGroupMember: (groupId: string, player_id: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean }>(`/api/chat/groups/${groupId}/members`, {
-          method: 'POST',
-          body: JSON.stringify({ player_id }),
-        }),
-      () => localStore.addGroupMember(groupId, player_id)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/chat/groups/${groupId}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ player_id }),
+    }),
 
   sendMessage: (payload: {
     receiver_id?: string | null;
@@ -523,85 +394,132 @@ export const api = {
     media_url?: string | null;
     media_type?: string | null;
   }) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ message: Message }>('/api/chat/messages', {
-          method: 'POST',
-          body: JSON.stringify(payload),
-        }),
-      () => localStore.sendMessage(payload, activePlayerIdMemory)
-    ),
+    apiFetch<{ message: Message }>('/api/chat/messages', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   reactMessage: (messageId: string, emoji: string | null) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ message: Message }>(`/api/chat/messages/${messageId}/react`, {
-          method: 'POST',
-          body: JSON.stringify({ emoji }),
-        }),
-      () => localStore.reactMessage(messageId, emoji, activePlayerIdMemory)
-    ),
+    apiFetch<{ message: Message }>(`/api/chat/messages/${messageId}/react`, {
+      method: 'POST',
+      body: JSON.stringify({ emoji }),
+    }),
 
   deleteMessage: (messageId: string, scope: 'me' | 'all') =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; message?: Message; deletedForMeId?: string }>(
-          `/api/chat/messages/${messageId}?scope=${scope}`,
-          { method: 'DELETE' }
-        ),
-      () => localStore.deleteMessage(messageId, scope, activePlayerIdMemory)
+    apiFetch<{ ok: boolean; message?: Message; deletedForMeId?: string }>(
+      `/api/chat/messages/${messageId}?scope=${scope}`,
+      { method: 'DELETE' }
     ),
 
   getNotifications: () =>
-    withStaticFallback(
-      () => apiFetch<{ notifications: NotificationItem[]; unreadCount: number }>('/api/notifications'),
-      () => localStore.getNotifications()
-    ),
+    apiFetch<{ notifications: NotificationItem[]; unreadCount: number }>('/api/notifications'),
 
   markAllNotificationsRead: () =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>('/api/notifications/read-all', { method: 'POST' }),
-      () => localStore.markAllNotificationsRead()
-    ),
+    apiFetch<{ ok: boolean }>('/api/notifications/read-all', { method: 'POST' }),
 
   markNotificationRead: (id: string) =>
-    withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/notifications/${id}/read`, { method: 'POST' }),
-      () => localStore.markNotificationRead(id)
-    ),
+    apiFetch<{ ok: boolean }>(`/api/notifications/${id}/read`, { method: 'POST' }),
 
   getBorders: () =>
-    withStaticFallback(
-      () =>
-        apiFetch<{
-          borders: BorderItem[];
-          collectionBorders?: BorderItem[];
-          ownedIds: string[];
-          equippedBorderId: string | null;
-          coins: number;
-          rawCount?: number;
-          rlsHint?: string | null;
-        }>('/api/borders'),
-      () => localStore.getBorders(activePlayerIdMemory)
-    ),
+    apiFetch<{
+      borders: BorderItem[];
+      collectionBorders?: BorderItem[];
+      ownedIds: string[];
+      equippedBorderId: string | null;
+      coins: number;
+      rawCount?: number;
+      rlsHint?: string | null;
+    }>('/api/borders'),
 
   buyBorder: (border_id: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; coins: number; border: BorderItem }>('/api/borders/buy', {
-          method: 'POST',
-          body: JSON.stringify({ border_id }),
-        }),
-      () => localStore.buyBorder(border_id, activePlayerIdMemory)
-    ),
+    apiFetch<{ ok: boolean; coins: number; border: BorderItem }>('/api/borders/buy', {
+      method: 'POST',
+      body: JSON.stringify({ border_id }),
+    }),
 
   equipBorder: (border_id: string) =>
-    withStaticFallback(
-      () =>
-        apiFetch<{ ok: boolean; border_id: string; player: Player }>('/api/borders/equip', {
-          method: 'POST',
-          body: JSON.stringify({ border_id }),
-        }),
-      () => localStore.equipBorder(border_id, activePlayerIdMemory)
+    apiFetch<{ ok: boolean; border_id: string; player: Player }>('/api/borders/equip', {
+      method: 'POST',
+      body: JSON.stringify({ border_id }),
+    }),
+
+  transferCoins: (payload: { to_player_id?: string; to_username?: string; amount: number }) =>
+    apiFetch<{
+      ok: boolean;
+      amount: number;
+      senderCoins: number;
+      recipient: Player;
+      transactionRecorded?: boolean;
+    }>('/api/coins/transfer', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getRealtimeConfig: () =>
+    apiFetch<{ enabled: boolean; url: string | null; anonKey: string | null }>(
+      '/api/realtime-config',
+      { cache: 'no-store' }
+    ),
+
+  getOwnerPanelState: () =>
+    apiFetch<{
+      activeBroadcasts: OwnerBroadcast[];
+      allBroadcasts?: OwnerBroadcast[];
+      stats?: OwnerPanelStats | null;
+      giveaways: Giveaway[];
+      serverNow: string;
+    }>('/api/owner/panel-state', { cache: 'no-store' }),
+
+  createOwnerBroadcast: (payload: {
+    title?: string;
+    message: string;
+    scheduled_at?: string;
+    is_active?: boolean;
+  }) =>
+    apiFetch<{ broadcast: OwnerBroadcast }>('/api/owner/broadcasts', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  updateOwnerBroadcast: (
+    id: string,
+    payload: {
+      title?: string;
+      message?: string;
+      scheduled_at?: string;
+      is_active?: boolean;
+    }
+  ) =>
+    apiFetch<{ broadcast: OwnerBroadcast | null }>(`/api/owner/broadcasts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
+  deleteOwnerBroadcast: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/owner/broadcasts/${id}`, { method: 'DELETE' }),
+
+  createGiveaway: (payload: {
+    amount_per_user: number;
+    max_winners: number;
+    scheduled_at: string;
+  }) =>
+    apiFetch<{ giveaway: Giveaway }>('/api/owner/giveaways', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  cancelGiveaway: (id: string) =>
+    apiFetch<{ ok: boolean; giveaway: Giveaway | null }>(
+      `/api/owner/giveaways/${id}/cancel`,
+      { method: 'PATCH' }
+    ),
+
+  deleteGiveaway: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/owner/giveaways/${id}`, { method: 'DELETE' }),
+
+  claimGiveaway: (id: string) =>
+    apiFetch<{ ok: boolean; amount: number; newCoins: number; claimedCount: number }>(
+      `/api/giveaways/${id}/claim`,
+      { method: 'POST' }
     ),
 };

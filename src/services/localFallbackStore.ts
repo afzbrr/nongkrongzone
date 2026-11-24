@@ -2,8 +2,12 @@ import type {
   BorderItem,
   ChatGroup,
   ConversationItem,
+  Giveaway,
+  GiveawayClaim,
   Message,
   NotificationItem,
+  OwnerBroadcast,
+  OwnerPanelStats,
   Player,
   Post,
   PostComment,
@@ -11,7 +15,9 @@ import type {
   StoryGroup,
   StoryReact,
   StoryView,
+  TransactionItem,
 } from '../types';
+import { getWibParts } from '../utils/wib';
 
 const STORAGE_KEY = 'nz_static_store_v1';
 const OWNER_TELEGRAM_ID = 6189849073;
@@ -88,6 +94,10 @@ interface LocalDbState {
   groups: ChatGroup[];
   groupMembers: Array<{ group_id: string; player_id: string }>;
   notifications: NotificationItem[];
+  transactions?: TransactionItem[];
+  broadcasts?: OwnerBroadcast[];
+  giveaways?: Giveaway[];
+  giveawayClaims?: GiveawayClaim[];
 }
 
 function uid(prefix = 'id'): string {
@@ -135,6 +145,10 @@ function createInitialDb(): LocalDbState {
     groups: [],
     groupMembers: [],
     notifications: [],
+    transactions: [],
+    broadcasts: [],
+    giveaways: [],
+    giveawayClaims: [],
   };
 }
 
@@ -195,12 +209,15 @@ function enrichPlayer(db: LocalDbState, target: Player, viewerId: string): Playe
     : ownerRow
       ? db.follows.some((f) => f.follower_id === target.id && f.following_id === ownerRow.id)
       : true;
+  const effectiveCoins = isOwner ? OWNER_COINS : Number(target.balance ?? target.coins ?? 0);
   return {
     ...target,
     name: target.full_name || target.name,
     full_name: target.full_name || target.name,
+    role: isOwner ? 'owner' : (target.role || 'user'),
     is_owner: isOwner,
-    coins: isOwner ? OWNER_COINS : target.coins,
+    coins: effectiveCoins,
+    balance: effectiveCoins,
     followers_count: followersCount,
     following_count: followingCount,
     posts_count: postsCount,
@@ -983,18 +1000,25 @@ export const localStore = {
     return { ok: true, message: msg, deletedForMeId: scope === 'me' ? messageId : undefined };
   },
 
-  getNotifications: () => {
+  getNotifications: (preferredId?: string | null) => {
     const db = readDb();
+    const me = getMe(db, preferredId);
+    const mine = db.notifications.filter(
+      (n) => (!n.user_id && !n.to_player_id) || n.user_id === me.id || n.to_player_id === me.id
+    );
     return {
-      notifications: db.notifications,
-      unreadCount: db.notifications.filter((n) => !n.is_read).length,
+      notifications: mine,
+      unreadCount: mine.filter((n) => !n.is_read).length,
     };
   },
 
-  markAllNotificationsRead: () => {
+  markAllNotificationsRead: (preferredId?: string | null) => {
     const db = readDb();
+    const me = getMe(db, preferredId);
     db.notifications.forEach((n) => {
-      n.is_read = true;
+      if ((!n.user_id && !n.to_player_id) || n.user_id === me.id || n.to_player_id === me.id) {
+        n.is_read = true;
+      }
     });
     saveDb(db);
     return { ok: true };
@@ -1008,5 +1032,400 @@ export const localStore = {
       saveDb(db);
     }
     return { ok: true };
+  },
+
+  transferCoins: (
+    payload: { to_player_id?: string; to_username?: string; amount: number },
+    preferredId?: string | null
+  ) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const senderRow = db.players.find((p) => p.id === me.id) || db.players[0];
+    const amount = Math.trunc(Number(payload.amount));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error('Jumlah coin harus lebih dari 0');
+    }
+
+    const recipient = payload.to_player_id
+      ? db.players.find((p) => p.id === payload.to_player_id)
+      : db.players.find(
+          (p) =>
+            p.username.toLowerCase() ===
+            String(payload.to_username || '').trim().replace(/^@/, '').toLowerCase()
+        );
+
+    if (!recipient) {
+      throw new Error('Pengguna tujuan tidak ditemukan');
+    }
+    if (recipient.id === senderRow.id) {
+      throw new Error('Tidak boleh transfer ke diri sendiri');
+    }
+
+    const senderIsOwner = Boolean(
+      senderRow.is_owner ||
+        senderRow.telegram_id === OWNER_TELEGRAM_ID ||
+        senderRow.username.toLowerCase() === 'afz'
+    );
+    const recipientIsOwner = Boolean(
+      recipient.is_owner ||
+        recipient.telegram_id === OWNER_TELEGRAM_ID ||
+        recipient.username.toLowerCase() === 'afz'
+    );
+
+    if (!senderIsOwner && Number(senderRow.coins || 0) < amount) {
+      throw new Error('Saldo tidak cukup');
+    }
+
+    if (!senderIsOwner) {
+      const nextSender = Number(senderRow.balance ?? senderRow.coins ?? 0) - amount;
+      senderRow.coins = nextSender;
+      senderRow.balance = nextSender;
+    }
+    if (!recipientIsOwner) {
+      const nextRec = Number(recipient.balance ?? recipient.coins ?? 0) + amount;
+      recipient.coins = nextRec;
+      recipient.balance = nextRec;
+    }
+
+    if (!Array.isArray(db.transactions)) db.transactions = [];
+    db.transactions.unshift({
+      id: uid('tx'),
+      sender_id: senderRow.id,
+      receiver_id: recipient.id,
+      amount,
+      tx_type: 'transfer',
+      note: `Transfer ke @${recipient.username}`,
+      created_at: new Date().toISOString(),
+    });
+
+    const msgText = `Kamu menerima ${amount.toLocaleString('id-ID')} coin dari @${senderRow.username}`;
+    db.notifications.unshift({
+      id: uid('notif'),
+      user_id: recipient.id,
+      to_player_id: recipient.id,
+      from_player_id: senderRow.id,
+      type: 'transfer',
+      title: 'Terima Coin',
+      message: msgText,
+      post_id: null,
+      is_read: false,
+      created_at: new Date().toISOString(),
+      from_player: enrichPlayer(db, senderRow, recipient.id),
+    });
+
+    saveDb(db);
+    return {
+      ok: true,
+      amount,
+      senderCoins: senderIsOwner ? OWNER_COINS : senderRow.coins,
+      recipient: enrichPlayer(db, recipient, senderRow.id),
+      transactionRecorded: true,
+    };
+  },
+
+  getOwnerPanelState: (preferredId?: string | null) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    const nowMs = Date.now();
+    const allBroadcasts = [...(db.broadcasts || [])].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    const activeBroadcasts = allBroadcasts.filter((b) => {
+      if (!b.is_active) return false;
+      const s = new Date(b.scheduled_at).getTime();
+      return Number.isFinite(s) && s <= nowMs;
+    });
+
+    const claims = db.giveawayClaims || [];
+    const giveaways: Giveaway[] = [...(db.giveaways || [])]
+      .filter((g) => (isOwner ? true : g.status !== 'cancelled'))
+      .sort((a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime())
+      .map((g) => {
+        const gClaims = claims.filter((c) => c.giveaway_id === g.id);
+        const claimedCount = Math.max(g.claimed_count || 0, gClaims.length);
+        let status = g.status;
+        const schedMs = new Date(g.scheduled_at).getTime();
+        if (status !== 'cancelled' && status !== 'ended') {
+          if (claimedCount >= g.max_winners) status = 'ended';
+          else if (Number.isFinite(schedMs) && schedMs <= nowMs) status = 'live';
+          else status = 'scheduled';
+        }
+        return {
+          ...g,
+          claimed_count: claimedCount,
+          status,
+          claimed_by_me: gClaims.some((c) => c.user_id === me.id),
+          ...(isOwner
+            ? {
+                claims: gClaims.map((c) => {
+                  const p = db.players.find((u) => u.id === c.user_id);
+                  return { ...c, player: p ? enrichPlayer(db, p, me.id) : undefined };
+                }),
+              }
+            : {}),
+        };
+      });
+
+    let stats: OwnerPanelStats | undefined;
+    if (isOwner) {
+      const todayDateWib = getWibParts(nowMs).dateStr;
+      const nonBanned = db.players.filter((p) => !p.is_banned);
+      const totalCoinsCirculating = nonBanned.reduce((sum, p) => {
+        const pOwner =
+          p.is_owner ||
+          p.role === 'owner' ||
+          p.telegram_id === OWNER_TELEGRAM_ID ||
+          p.username.toLowerCase() === 'afz';
+        return pOwner ? sum : sum + Number(p.balance ?? p.coins ?? 0);
+      }, 0);
+      const todayTx = (db.transactions || []).filter(
+        (t) =>
+          (!t.tx_type || t.tx_type === 'transfer') &&
+          getWibParts(t.created_at).dateStr === todayDateWib
+      );
+      stats = {
+        totalUsers: nonBanned.length,
+        totalCoinsCirculating,
+        todayTransfersCount: todayTx.length,
+        todayTransfersVolume: todayTx.reduce((s, t) => s + Number(t.amount || 0), 0),
+      };
+    }
+
+    return {
+      activeBroadcasts,
+      ...(isOwner ? { allBroadcasts, stats } : {}),
+      giveaways,
+      serverNow: new Date(nowMs).toISOString(),
+    };
+  },
+
+  createOwnerBroadcast: (
+    payload: { title?: string; message: string; scheduled_at?: string; is_active?: boolean },
+    preferredId?: string | null
+  ) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat membuat broadcast');
+    const message = String(payload.message || '').trim();
+    if (!message || message.length > 240) {
+      throw new Error('Isi pesan broadcast wajib diisi (maks. 240 karakter)');
+    }
+    const schedMs = payload.scheduled_at ? new Date(payload.scheduled_at).getTime() : Date.now();
+    const broadcast: OwnerBroadcast = {
+      id: uid('bc'),
+      title: String(payload.title || 'Pengumuman Owner').trim().slice(0, 80) || 'Pengumuman Owner',
+      message,
+      scheduled_at: new Date(Number.isFinite(schedMs) ? schedMs : Date.now()).toISOString(),
+      is_active: payload.is_active !== false,
+      created_by: me.id,
+      created_at: new Date().toISOString(),
+    };
+    if (!Array.isArray(db.broadcasts)) db.broadcasts = [];
+    db.broadcasts.unshift(broadcast);
+    saveDb(db);
+    return { broadcast };
+  },
+
+  updateOwnerBroadcast: (
+    id: string,
+    payload: { title?: string; message?: string; scheduled_at?: string; is_active?: boolean },
+    preferredId?: string | null
+  ) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat mengedit broadcast');
+    let updated: OwnerBroadcast | null = null;
+    db.broadcasts = (db.broadcasts || []).map((b) => {
+      if (b.id !== id) return b;
+      updated = {
+        ...b,
+        ...(payload.title !== undefined ? { title: payload.title.trim() || 'Pengumuman Owner' } : {}),
+        ...(payload.message !== undefined ? { message: payload.message.trim() } : {}),
+        ...(payload.scheduled_at !== undefined
+          ? { scheduled_at: new Date(payload.scheduled_at).toISOString() }
+          : {}),
+        ...(payload.is_active !== undefined ? { is_active: payload.is_active } : {}),
+      };
+      return updated;
+    });
+    saveDb(db);
+    return { broadcast: updated };
+  },
+
+  deleteOwnerBroadcast: (id: string, preferredId?: string | null) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat menghapus broadcast');
+    db.broadcasts = (db.broadcasts || []).filter((b) => b.id !== id);
+    saveDb(db);
+    return { ok: true };
+  },
+
+  createGiveaway: (
+    payload: { amount_per_user: number; max_winners: number; scheduled_at: string },
+    preferredId?: string | null
+  ) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat membuat event bagi-bagi coin');
+    const schedMs = new Date(payload.scheduled_at).getTime();
+    const giveaway: Giveaway = {
+      id: uid('giveaway'),
+      amount_per_user: Math.trunc(Number(payload.amount_per_user)),
+      max_winners: Math.trunc(Number(payload.max_winners)),
+      claimed_count: 0,
+      scheduled_at: new Date(schedMs).toISOString(),
+      status: schedMs <= Date.now() ? 'live' : 'scheduled',
+      created_by: me.id,
+      created_at: new Date().toISOString(),
+      claimed_by_me: false,
+      claims: [],
+    };
+    if (!Array.isArray(db.giveaways)) db.giveaways = [];
+    db.giveaways.unshift(giveaway);
+    saveDb(db);
+    return { giveaway };
+  },
+
+  cancelGiveaway: (id: string, preferredId?: string | null) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat membatalkan event');
+    let updated: Giveaway | null = null;
+    db.giveaways = (db.giveaways || []).map((g) => {
+      if (g.id !== id) return g;
+      updated = { ...g, status: 'cancelled' };
+      return updated;
+    });
+    saveDb(db);
+    return { ok: true, giveaway: updated };
+  },
+
+  deleteGiveaway: (id: string, preferredId?: string | null) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (!isOwner) throw new Error('Hanya Owner yang dapat menghapus event');
+    db.giveaways = (db.giveaways || []).filter((g) => g.id !== id);
+    db.giveawayClaims = (db.giveawayClaims || []).filter((c) => c.giveaway_id !== id);
+    saveDb(db);
+    return { ok: true };
+  },
+
+  claimGiveaway: (giveawayId: string, preferredId?: string | null) => {
+    const db = readDb();
+    const me = getMe(db, preferredId);
+    const isOwner = Boolean(
+      me.is_owner ||
+        me.role === 'owner' ||
+        me.telegram_id === OWNER_TELEGRAM_ID ||
+        me.username.toLowerCase() === 'afz'
+    );
+    if (isOwner) throw new Error('Akun Owner tidak mengambil kuota member');
+    const giveaway = (db.giveaways || []).find((g) => g.id === giveawayId);
+    if (!giveaway) throw new Error('Event bagi-bagi coin tidak ditemukan');
+    if (giveaway.status === 'cancelled') {
+      throw new Error('Event bagi-bagi coin telah dibatalkan');
+    }
+    if (Date.now() < new Date(giveaway.scheduled_at).getTime()) {
+      throw new Error('Belum waktunya klaim! Tunggu sampai jam WIB yang ditentukan.');
+    }
+    if (!Array.isArray(db.giveawayClaims)) db.giveawayClaims = [];
+    const gClaims = db.giveawayClaims.filter((c) => c.giveaway_id === giveawayId);
+    if (gClaims.some((c) => c.user_id === me.id)) {
+      throw new Error('Sudah Diklaim! Kamu hanya bisa klaim 1 kali per event.');
+    }
+    if (giveaway.status === 'ended' || gClaims.length >= giveaway.max_winners) {
+      throw new Error('Slot Habis! Kuota bagi-bagi coin sudah penuh.');
+    }
+    db.giveawayClaims.unshift({
+      id: uid('claim'),
+      giveaway_id: giveawayId,
+      user_id: me.id,
+      amount: giveaway.amount_per_user,
+      claimed_at: new Date().toISOString(),
+    });
+    const nextCount = gClaims.length + 1;
+    giveaway.claimed_count = nextCount;
+    giveaway.status = nextCount >= giveaway.max_winners ? 'ended' : 'live';
+
+    const target = db.players.find((p) => p.id === me.id)!;
+    const nextCoins = Number(target.balance ?? target.coins ?? 0) + giveaway.amount_per_user;
+    target.coins = nextCoins;
+    target.balance = nextCoins;
+
+    if (!Array.isArray(db.transactions)) db.transactions = [];
+    db.transactions.unshift({
+      id: uid('tx'),
+      sender_id: db.players[0]?.id || me.id,
+      receiver_id: me.id,
+      amount: giveaway.amount_per_user,
+      tx_type: 'giveaway',
+      note: `Bagi-Bagi Coin (+${giveaway.amount_per_user.toLocaleString('id-ID')} coin)`,
+      created_at: new Date().toISOString(),
+    });
+
+    db.notifications.unshift({
+      id: uid('notif'),
+      user_id: me.id,
+      to_player_id: me.id,
+      from_player_id: db.players[0]?.id || null,
+      type: 'coin_drop',
+      title: 'Terima Coin',
+      message: `Kamu mendapat ${giveaway.amount_per_user.toLocaleString('id-ID')} coin dari Bagi-Bagi Coin Owner!`,
+      post_id: null,
+      is_read: false,
+      created_at: new Date().toISOString(),
+      from_player: db.players[0] ? enrichPlayer(db, db.players[0], me.id) : null,
+    });
+
+    saveDb(db);
+    return {
+      ok: true,
+      amount: giveaway.amount_per_user,
+      newCoins: nextCoins,
+      claimedCount: nextCount,
+    };
   },
 };

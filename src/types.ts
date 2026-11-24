@@ -8,6 +8,8 @@ export interface Player {
   telegram_avatar_url?: string | null;
   bio: string | null;
   coins: number;
+  balance?: number;
+  role?: 'user' | 'owner' | string;
   is_owner: boolean;
   is_banned: boolean;
   border_id: string | null;
@@ -152,12 +154,73 @@ export interface ConversationItem {
 
 export interface NotificationItem {
   id: string;
-  to_player_id: string;
-  from_player_id: string | null;
-  type: 'like' | 'comment' | 'follow' | 'tag' | 'story_react' | 'story_reply' | 'mention' | string;
+  user_id?: string;
+  to_player_id?: string;
+  from_player_id?: string | null;
+  type?:
+    | 'like'
+    | 'comment'
+    | 'follow'
+    | 'tag'
+    | 'story_react'
+    | 'story_reply'
+    | 'mention'
+    | 'transfer'
+    | 'coin_drop'
+    | string;
   title: string;
-  post_id: string | null;
+  message?: string | null;
+  post_id?: string | null;
   is_read: boolean;
   created_at: string;
   from_player?: Player | null;
+}
+
+export interface TransactionItem {
+  id: string;
+  sender_id: string;
+  receiver_id: string;
+  amount: number;
+  tx_type: 'transfer' | 'giveaway' | string;
+  note?: string | null;
+  created_at: string;
+}
+
+export interface OwnerBroadcast {
+  id: string;
+  title: string;
+  message: string;
+  scheduled_at: string;
+  is_active: boolean;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export interface GiveawayClaim {
+  id: string;
+  giveaway_id: string;
+  user_id: string;
+  amount: number;
+  claimed_at: string;
+  player?: Player;
+}
+
+export interface Giveaway {
+  id: string;
+  amount_per_user: number;
+  max_winners: number;
+  claimed_count: number;
+  scheduled_at: string;
+  status: 'scheduled' | 'live' | 'ended' | 'cancelled' | string;
+  created_by?: string | null;
+  created_at: string;
+  claimed_by_me?: boolean;
+  claims?: GiveawayClaim[];
+}
+
+export interface OwnerPanelStats {
+  totalUsers: number;
+  totalCoinsCirculating: number;
+  todayTransfersCount: number;
+  todayTransfersVolume: number;
 }
