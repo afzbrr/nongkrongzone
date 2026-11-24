@@ -8,9 +8,11 @@ import {
   Coins,
   Edit3,
   ImagePlus,
+  LayoutGrid,
   Lock,
   MessageCircle,
   Palette,
+  Repeat2,
   RotateCcw,
   Shield,
   X,
@@ -72,6 +74,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [blockedList, setBlockedList] = useState<Player[]>([]);
 
   const [themeSheetOpen, setThemeSheetOpen] = useState(false);
+  const [profileContentTab, setProfileContentTab] = useState<'posts' | 'reposts'>('posts');
   const [sheetDragY, setSheetDragY] = useState(0);
   const dragStartYRef = useRef<number | null>(null);
 
@@ -103,6 +106,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    setProfileContentTab('posts');
+  }, [username]);
 
   useEffect(() => {
     loadProfileData();
@@ -549,17 +556,87 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         </div>
       </div>
 
-      {/* Posts Feed of this user */}
-      {profile.is_blocked_by_me || profile.has_blocked_me ? (
-        <div className="py-16 text-center px-6 text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
-          Postingan disembunyikan karena pengguna ini diblokir.
+      {/* Tabs: Postingan & Repost */}
+      {!profile.is_blocked_by_me && !profile.has_blocked_me && (
+        <div className="grid grid-cols-2 border-b" style={{ borderColor: 'var(--nz-border)' }}>
+          <button
+            type="button"
+            onClick={() => setProfileContentTab('posts')}
+            className="h-11 flex items-center justify-center gap-1.5 text-[12.5px] font-semibold relative transition-colors"
+            style={{
+              color: profileContentTab === 'posts' ? 'var(--nz-text)' : 'var(--nz-text-muted)',
+            }}
+          >
+            <LayoutGrid className="w-4 h-4" strokeWidth={1.75} />
+            <span>Postingan</span>
+            <span className="text-[11px] opacity-75 tabular-nums">
+              ({formatNumber(posts.filter((p) => !p.original_post_id).length)})
+            </span>
+            {profileContentTab === 'posts' && (
+              <span
+                className="absolute bottom-0 left-4 right-4 h-[2px] rounded-full"
+                style={{ background: 'var(--nz-btn-bg)' }}
+              />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setProfileContentTab('reposts')}
+            className="h-11 flex items-center justify-center gap-1.5 text-[12.5px] font-semibold relative transition-colors"
+            style={{
+              color: profileContentTab === 'reposts' ? 'var(--nz-text)' : 'var(--nz-text-muted)',
+            }}
+          >
+            <Repeat2 className="w-4 h-4" strokeWidth={1.75} />
+            <span>Repost</span>
+            <span className="text-[11px] opacity-75 tabular-nums">
+              ({formatNumber(posts.filter((p) => Boolean(p.original_post_id)).length)})
+            </span>
+            {profileContentTab === 'reposts' && (
+              <span
+                className="absolute bottom-0 left-4 right-4 h-[2px] rounded-full"
+                style={{ background: 'var(--nz-btn-bg)' }}
+              />
+            )}
+          </button>
         </div>
-      ) : posts.length === 0 ? (
-        <div className="py-16 text-center text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
-          Belum ada postingan
-        </div>
-      ) : (
-        posts.map((post) => (
+      )}
+
+      {/* Posts / Reposts Feed of this user */}
+      {(() => {
+        const displayedPosts =
+          profileContentTab === 'reposts'
+            ? posts.filter((p) => Boolean(p.original_post_id))
+            : posts.filter((p) => !p.original_post_id);
+
+        if (profile.is_blocked_by_me || profile.has_blocked_me) {
+          return (
+            <div className="py-16 text-center px-6 text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
+              Postingan disembunyikan karena pengguna ini diblokir.
+            </div>
+          );
+        }
+
+        if (displayedPosts.length === 0) {
+          return (
+            <div
+              className="py-16 flex flex-col items-center justify-center gap-2 text-center text-[13px]"
+              style={{ color: 'var(--nz-text-muted)' }}
+            >
+              {profileContentTab === 'reposts' ? (
+                <>
+                  <Repeat2 className="w-5 h-5 opacity-70" strokeWidth={1.6} />
+                  <span>Belum ada repost</span>
+                </>
+              ) : (
+                <span>Belum ada postingan</span>
+              )}
+            </div>
+          );
+        }
+
+        return displayedPosts.map((post) => (
           <PostCard
             key={post.id}
             post={post}
@@ -571,15 +648,18 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             onDeletePost={handleDeletePost}
             onBlockUser={async (target) => {
               const res = await api.block(target.id);
-              if (!currentUser.is_owner && (res.follows_owner === false || target.is_owner || target.telegram_id === 6189849073)) {
+              if (
+                !currentUser.is_owner &&
+                (res.follows_owner === false || target.is_owner || target.telegram_id === 6189849073)
+              ) {
                 onOwnerUnfollowed?.();
                 return;
               }
               loadProfileData();
             }}
           />
-        ))
-      )}
+        ));
+      })()}
 
       {/* Unfollow Confirmation Dialog */}
       {unfollowConfirmOpen && (
