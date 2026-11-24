@@ -13,7 +13,6 @@ import {
   Palette,
   RotateCcw,
   Shield,
-  Users,
   X,
 } from 'lucide-react';
 import type { Player, Post } from '../types';
@@ -28,12 +27,11 @@ import { PostCard } from './PostCard';
 interface ProfileViewProps {
   username: string;
   currentUser: Player;
-  allPlayers: Player[];
   onBack?: () => void;
   onOpenProfile: (username: string) => void;
   onOpenChatWith: (peer: Player) => void;
-  onSwitchAccount: (playerId: string) => void;
   onCurrentUserUpdated: (updated: Player) => void;
+  onOwnerUnfollowed?: () => void;
   onOpenComments: (post: Post) => void;
   onOpenBorders?: () => void;
 }
@@ -41,12 +39,11 @@ interface ProfileViewProps {
 export const ProfileView: React.FC<ProfileViewProps> = ({
   username,
   currentUser,
-  allPlayers,
   onBack,
   onOpenProfile,
   onOpenChatWith,
-  onSwitchAccount,
   onCurrentUserUpdated,
+  onOwnerUnfollowed,
   onOpenComments,
   onOpenBorders,
 }) => {
@@ -64,6 +61,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   const [editOpen, setEditOpen] = useState(false);
   const [editName, setEditName] = useState('');
+  const [editUsername, setEditUsername] = useState('');
   const [editBio, setEditBio] = useState('');
   const [editAvatar, setEditAvatar] = useState('');
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
@@ -73,7 +71,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [blockedModalOpen, setBlockedModalOpen] = useState(false);
   const [blockedList, setBlockedList] = useState<Player[]>([]);
 
-  const [switcherOpen, setSwitcherOpen] = useState(false);
   const [themeSheetOpen, setThemeSheetOpen] = useState(false);
   const [sheetDragY, setSheetDragY] = useState(0);
   const dragStartYRef = useRef<number | null>(null);
@@ -129,7 +126,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   const handleConfirmUnfollow = async () => {
     if (!profile) return;
-    await api.unfollow(profile.id);
+    const res = await api.unfollow(profile.id);
+    setUnfollowConfirmOpen(false);
+    if (!currentUser.is_owner && (res.follows_owner === false || profile.is_owner || profile.telegram_id === 6189849073)) {
+      onOwnerUnfollowed?.();
+      return;
+    }
     setProfile((prev) =>
       prev
         ? {
@@ -139,7 +141,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           }
         : prev
     );
-    setUnfollowConfirmOpen(false);
   };
 
   const handleBlockToggle = async () => {
@@ -148,7 +149,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       await api.unblock(profile.id);
       await loadProfileData();
     } else {
-      await api.block(profile.id);
+      const res = await api.block(profile.id);
+      if (!currentUser.is_owner && (res.follows_owner === false || profile.is_owner || profile.telegram_id === 6189849073)) {
+        onOwnerUnfollowed?.();
+        return;
+      }
       await loadProfileData();
     }
   };
@@ -169,7 +174,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const handleDirectUnfollowInList = async (target: Player) => {
-    await api.unfollow(target.id);
+    const res = await api.unfollow(target.id);
+    if (!currentUser.is_owner && (res.follows_owner === false || target.is_owner || target.telegram_id === 6189849073)) {
+      setFollowSheetMode(null);
+      onOwnerUnfollowed?.();
+      return;
+    }
     setFollowList((prev) => prev.filter((p) => p.id !== target.id));
     if (isMe) {
       setProfile((prev) =>
@@ -216,16 +226,36 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       setEditNotice('Nama tidak boleh kosong');
       return;
     }
+    const canEditUsername = profile?.has_telegram_username === false;
+    let cleanedUsername: string | undefined;
+    if (canEditUsername) {
+      cleanedUsername = editUsername
+        .trim()
+        .replace(/^@/, '')
+        .replace(/[^a-zA-Z0-9_]/g, '')
+        .toLowerCase()
+        .slice(0, 20);
+      if (cleanedUsername.length < 3) {
+        setEditNotice('Username minimal 3 karakter (huruf, angka, atau _)');
+        return;
+      }
+    }
+
     setSavingEdit(true);
     setEditNotice(null);
     try {
       const res = await api.updateMe({
         full_name: cleanedName,
+        ...(cleanedUsername !== undefined ? { username: cleanedUsername } : {}),
         bio: editBio,
         avatar_url: editAvatar || null,
       });
-      setProfile(res.player);
-      onCurrentUserUpdated(res.player);
+      const updatedPlayer: Player = {
+        ...res.player,
+        has_telegram_username: res.player.has_telegram_username ?? profile?.has_telegram_username,
+      };
+      setProfile(updatedPlayer);
+      onCurrentUserUpdated(updatedPlayer);
       setEditOpen(false);
     } catch (err: any) {
       setEditNotice(err?.message || 'Gagal menyimpan profil');
@@ -415,6 +445,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 type="button"
                 onClick={() => {
                   setEditName((profile.full_name || profile.name || '').slice(0, 20));
+                  setEditUsername(profile.username || '');
                   setEditBio(profile.bio || '');
                   setEditAvatar(profile.avatar_url || '');
                   setEditNotice(null);
@@ -460,22 +491,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 <Shield className="w-3.5 h-3.5" strokeWidth={1.5} />
                 <span>Diblokir</span>
               </button>
-
-              {allPlayers.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => setSwitcherOpen(true)}
-                  className="h-8 px-3.5 rounded-full border text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
-                  style={{
-                    background: 'var(--nz-card)',
-                    borderColor: 'var(--nz-border)',
-                    color: 'var(--nz-text-muted)',
-                  }}
-                >
-                  <Users className="w-3.5 h-3.5" strokeWidth={1.5} />
-                  <span>Ganti Akun</span>
-                </button>
-              )}
             </>
           ) : (
             <>
@@ -555,7 +570,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             onRepost={handleRepost}
             onDeletePost={handleDeletePost}
             onBlockUser={async (target) => {
-              await api.block(target.id);
+              const res = await api.block(target.id);
+              if (!currentUser.is_owner && (res.follows_owner === false || target.is_owner || target.telegram_id === 6189849073)) {
+                onOwnerUnfollowed?.();
+                return;
+              }
               loadProfileData();
             }}
           />
@@ -795,25 +814,62 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               />
             </label>
 
-            {/* Username (DISABLED, abu-abu, ikon gembok) */}
-            <div className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
-              <span>Username Telegram</span>
-              <div className="relative flex items-center">
-                <input
-                  type="text"
-                  value={`@${profile.username}`}
-                  disabled
-                  readOnly
-                  aria-label="Username Telegram (tidak dapat diubah)"
-                  className="w-full border rounded-[10px] pl-3 pr-9 py-2 text-[13px] bg-[#27272A]/40 text-[#9CA3AF] cursor-not-allowed opacity-80 select-none"
-                  style={{ borderColor: 'var(--nz-border)' }}
-                />
-                <Lock className="w-4 h-4 text-[#9CA3AF] absolute right-3 pointer-events-none" strokeWidth={1.75} />
+            {/* Username: editable jika Telegram tidak punya username, terkunci jika punya username Telegram */}
+            {profile.has_telegram_username === false ? (
+              <label className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
+                <div className="flex items-center justify-between">
+                  <span>Username (Bisa Diubah)</span>
+                  <span className="tabular-nums text-[11px]">{editUsername.length}/20</span>
+                </div>
+                <div className="relative flex items-center">
+                  <span
+                    className="absolute left-3 text-[13px] font-semibold select-none"
+                    style={{ color: 'var(--nz-text-muted)' }}
+                  >
+                    @
+                  </span>
+                  <input
+                    type="text"
+                    value={editUsername}
+                    maxLength={20}
+                    onChange={(e) =>
+                      setEditUsername(
+                        e.target.value.replace(/^@/, '').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase().slice(0, 20)
+                      )
+                    }
+                    placeholder="buat_username"
+                    className="w-full border rounded-[10px] pl-7 pr-3 py-2 text-[13px] focus:outline-none"
+                    style={{
+                      background: 'var(--nz-elevated)',
+                      borderColor: 'var(--nz-border)',
+                      color: 'var(--nz-text)',
+                    }}
+                  />
+                </div>
+                <p className="text-[11px] leading-snug" style={{ color: 'var(--nz-text-muted)' }}>
+                  Akun Telegram kamu belum punya username. Kamu bebas pasang atau ubah username sendiri di sini (3–20 huruf, angka, atau _).
+                </p>
+              </label>
+            ) : (
+              <div className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
+                <span>Username Telegram</span>
+                <div className="relative flex items-center">
+                  <input
+                    type="text"
+                    value={`@${profile.username}`}
+                    disabled
+                    readOnly
+                    aria-label="Username Telegram (tidak dapat diubah)"
+                    className="w-full border rounded-[10px] pl-3 pr-9 py-2 text-[13px] bg-[#27272A]/40 text-[#9CA3AF] cursor-not-allowed opacity-80 select-none"
+                    style={{ borderColor: 'var(--nz-border)' }}
+                  />
+                  <Lock className="w-4 h-4 text-[#9CA3AF] absolute right-3 pointer-events-none" strokeWidth={1.75} />
+                </div>
+                <p className="text-[11px] leading-snug text-[#9CA3AF]">
+                  Username ngikutin akun Telegram, gak bisa diubah di sini. Kalau mau ganti, ganti di Telegram ya.
+                </p>
               </div>
-              <p className="text-[11px] leading-snug text-[#9CA3AF]">
-                Username ngikutin akun Telegram, gak bisa diubah di sini. Kalau mau ganti, ganti di Telegram ya.
-              </p>
-            </div>
+            )}
 
             {/* Bio */}
             <label className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
@@ -918,62 +974,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   </div>
                 ))
               )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Account Switcher Modal */}
-      {switcherOpen && (
-        <div className="fixed inset-0 z-50 bg-black/75 flex items-end justify-center">
-          <div
-            className="w-full max-w-[480px] max-h-[65dvh] border-t rounded-t-[16px] flex flex-col"
-            style={{ background: 'var(--nz-modal-bg)', borderColor: 'var(--nz-border)' }}
-          >
-            <div
-              className="px-4 h-12 border-b flex items-center justify-between"
-              style={{ borderColor: 'var(--nz-border)' }}
-            >
-              <span className="font-display text-[14px] font-bold" style={{ color: 'var(--nz-text)' }}>
-                Pilih Akun Aktif
-              </span>
-              <button type="button" onClick={() => setSwitcherOpen(false)}>
-                <X className="w-5 h-5" style={{ color: 'var(--nz-text-muted)' }} />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto px-4">
-              {allPlayers.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => {
-                    setSwitcherOpen(false);
-                    onSwitchAccount(p.id);
-                  }}
-                  className="w-full py-3 flex items-center justify-between text-left border-b last:border-b-0"
-                  style={{ borderColor: 'var(--nz-border)' }}
-                >
-                  <div className="flex items-center gap-2.5">
-                    <Avatar player={p} size={36} />
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[13px] font-semibold" style={{ color: 'var(--nz-text)' }}>
-                          {p.name}
-                        </span>
-                        {p.is_owner && <OwnerBadge compact />}
-                      </div>
-                      <div className="text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
-                        @{p.username}
-                      </div>
-                    </div>
-                  </div>
-                  {p.id === currentUser.id && (
-                    <span className="text-[11px] font-semibold" style={{ color: 'var(--nz-accent-text)' }}>
-                      Aktif
-                    </span>
-                  )}
-                </button>
-              ))}
             </div>
           </div>
         </div>

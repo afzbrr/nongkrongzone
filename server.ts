@@ -18,6 +18,7 @@ const SESSION_SECRET =
   (process.env.SESSION_SECRET || '').trim() || crypto.randomBytes(32).toString('hex');
 
 const telegramAvatarMemoryCache = new Map<string, string>();
+const telegramHasUsernameCache = new Map<string, boolean>();
 const schemaCaps = {
   checked: false,
   hasTelegramAvatarCol: false,
@@ -255,12 +256,20 @@ function normalizePlayer(row: any): any {
   if (tgAvatar && row.id) {
     telegramAvatarMemoryCache.set(String(row.id), tgAvatar);
   }
+  const cachedHasTgUsername = row.id ? telegramHasUsernameCache.get(String(row.id)) : undefined;
+  const hasTelegramUsername =
+    cachedHasTgUsername !== undefined
+      ? cachedHasTgUsername
+      : isOwner
+        ? true
+        : !/^tg_\d+/.test(String(row.username || ''));
   return {
     ...row,
     name: fullName,
     full_name: fullName,
     telegram_avatar_url: tgAvatar,
     is_owner: isOwner,
+    has_telegram_username: hasTelegramUsername,
     coins: isOwner ? OWNER_COINS : Number(row.coins || 0),
   };
 }
@@ -754,6 +763,44 @@ async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId
   };
 }
 
+async function resolveOwnerAndFollowStatus(sb: SupabaseClient, viewer: any) {
+  let { data: ownerRow } = await sb
+    .from('players')
+    .select('*')
+    .eq('telegram_id', OWNER_TELEGRAM_ID)
+    .maybeSingle();
+
+  if (!ownerRow) {
+    const ownerPayload = {
+      telegram_id: OWNER_TELEGRAM_ID,
+      name: OWNER_NAME,
+      username: OWNER_DEFAULT_USERNAME,
+      coins: OWNER_COINS,
+      is_owner: true,
+      border_id: OWNER_BORDER,
+    };
+    const { data: insertedOwner } = await sb
+      .from('players')
+      .upsert(ownerPayload, { onConflict: 'telegram_id' })
+      .select('*')
+      .maybeSingle();
+    ownerRow = insertedOwner || null;
+  }
+
+  const normalizedOwner = ownerRow ? normalizePlayer(ownerRow) : null;
+  let followsOwner = Boolean(viewer?.is_owner || isOwnerByTelegramId(viewer?.telegram_id));
+  if (!followsOwner && normalizedOwner?.id && viewer?.id) {
+    const { data: followRow } = await sb
+      .from('follows')
+      .select('id')
+      .eq('follower_id', viewer.id)
+      .eq('following_id', normalizedOwner.id)
+      .maybeSingle();
+    followsOwner = Boolean(followRow);
+  }
+  return { ownerPlayer: normalizedOwner, followsOwner };
+}
+
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
@@ -1201,7 +1248,7 @@ async function startServer() {
         bio: initialBio,
         is_owner: isOwner,
         is_banned: false,
-        coins: isOwner ? OWNER_COINS : 0,
+        coins: isOwner ? OWNER_COINS : 500,
         border_id: isOwner ? OWNER_BORDER : null,
       };
       if (caps.hasTelegramAvatarCol) {
@@ -1296,25 +1343,36 @@ async function startServer() {
     if (tgPhotoUrl && activeRow?.id) {
       telegramAvatarMemoryCache.set(String(activeRow.id), tgPhotoUrl);
     }
+    if (activeRow?.id) {
+      telegramHasUsernameCache.set(String(activeRow.id), Boolean(rawTgUsername));
+    }
 
     const normalizedRow = normalizePlayer(activeRow);
     await syncProfilesTable(sb, normalizedRow);
 
-    const enriched = await enrichPlayerStats(sb, normalizedRow, normalizedRow.id);
-    const { data: allPlayers } = await sb
-      .from('players')
-      .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
-      .eq('is_banned', false)
-      .order('is_owner', { ascending: false })
-      .order('created_at', { ascending: true })
-      .limit(50);
+    const [enriched, ownerState, playersRes] = await Promise.all([
+      enrichPlayerStats(sb, normalizedRow, normalizedRow.id),
+      resolveOwnerAndFollowStatus(sb, normalizedRow),
+      sb
+        .from('players')
+        .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
+        .eq('is_banned', false)
+        .order('is_owner', { ascending: false })
+        .order('created_at', { ascending: true })
+        .limit(50),
+    ]);
 
     return {
       status: 200,
       body: {
-        player: enriched,
+        player: {
+          ...enriched,
+          has_telegram_username: Boolean(rawTgUsername),
+          follows_owner: ownerState.followsOwner,
+        },
         sessionToken: signSessionToken(normalizedRow.id),
-        players: (allPlayers || []).map((p) => normalizePlayer(p)),
+        players: (playersRes.data || []).map((p) => normalizePlayer(p)),
+        ownerPlayer: ownerState.ownerPlayer,
       },
     };
   }
@@ -1379,25 +1437,32 @@ async function startServer() {
     }
     try {
       const player = await ensureOwnerAndResolvePlayer(sb, req);
-      const enriched = await enrichPlayerStats(sb, player, player.id);
-      const { data: allPlayers } = await sb
-        .from('players')
-        .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
-        .eq('is_banned', false)
-        .order('is_owner', { ascending: false })
-        .order('created_at', { ascending: true })
-        .limit(50);
+      const [enriched, ownerState, playersRes] = await Promise.all([
+        enrichPlayerStats(sb, player, player.id),
+        resolveOwnerAndFollowStatus(sb, player),
+        sb
+          .from('players')
+          .select('id, telegram_id, name, username, avatar_url, is_owner, border_id, coins')
+          .eq('is_banned', false)
+          .order('is_owner', { ascending: false })
+          .order('created_at', { ascending: true })
+          .limit(50),
+      ]);
       return res.json({
-        player: enriched,
+        player: {
+          ...enriched,
+          follows_owner: ownerState.followsOwner,
+        },
         sessionToken: signSessionToken(player.id),
-        players: (allPlayers || []).map((p) => normalizePlayer(p)),
+        players: (playersRes.data || []).map((p) => normalizePlayer(p)),
+        ownerPlayer: ownerState.ownerPlayer,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memuat akun' });
     }
   });
 
-  // Update own profile: ONLY full_name (max 20 chars), avatar_url, and bio. NEVER allow updating username or coins/is_owner.
+  // Update own profile: full_name (max 20 chars), avatar_url, bio, and username ONLY when Telegram account has no username
   app.patch('/api/players/me', async (req: Request, res: Response) => {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
@@ -1419,6 +1484,41 @@ async function startServer() {
         updates.name = trimmedName;
       }
 
+      if (typeof req.body?.username === 'string') {
+        const cachedHasTg = telegramHasUsernameCache.get(String(me.id));
+        const hasTgUsername = me.is_owner
+          ? true
+          : cachedHasTg !== undefined
+            ? cachedHasTg
+            : !/^tg_\d+/.test(String(me.username || ''));
+        if (hasTgUsername) {
+          return res.status(400).json({
+            error: 'Username mengikuti akun Telegram kamu dan tidak dapat diubah',
+          });
+        }
+        const cleanedUsername = req.body.username
+          .trim()
+          .replace(/^@/, '')
+          .replace(/[^a-zA-Z0-9_]/g, '')
+          .toLowerCase()
+          .slice(0, 20);
+        if (cleanedUsername.length < 3) {
+          return res.status(400).json({
+            error: 'Username minimal 3 karakter (huruf, angka, atau _)',
+          });
+        }
+        const { data: existingUsername } = await sb
+          .from('players')
+          .select('id')
+          .ilike('username', cleanedUsername)
+          .neq('id', me.id)
+          .maybeSingle();
+        if (existingUsername) {
+          return res.status(400).json({ error: 'Username sudah dipakai pengguna lain' });
+        }
+        updates.username = cleanedUsername;
+      }
+
       if (typeof req.body?.bio === 'string') {
         updates.bio = req.body.bio.trim().slice(0, 300);
       }
@@ -1436,7 +1536,11 @@ async function startServer() {
       }
 
       if (Object.keys(updates).length === 0) {
-        return res.json({ player: await enrichPlayerStats(sb, me, me.id) });
+        const [enriched, ownerState] = await Promise.all([
+          enrichPlayerStats(sb, me, me.id),
+          resolveOwnerAndFollowStatus(sb, me),
+        ]);
+        return res.json({ player: { ...enriched, follows_owner: ownerState.followsOwner } });
       }
 
       const { data: updated, error } = await sb
@@ -1449,7 +1553,11 @@ async function startServer() {
 
       await syncProfilesTable(sb, updated);
 
-      return res.json({ player: await enrichPlayerStats(sb, updated, me.id) });
+      const [enriched, ownerState] = await Promise.all([
+        enrichPlayerStats(sb, updated, me.id),
+        resolveOwnerAndFollowStatus(sb, updated),
+      ]);
+      return res.json({ player: { ...enriched, follows_owner: ownerState.followsOwner } });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal update profil' });
     }
@@ -1625,7 +1733,8 @@ async function startServer() {
         broadcastToPlayer(targetId, 'notification:new', { ...notif, from_player: me });
       }
 
-      return res.json({ ok: true });
+      const ownerState = await resolveOwnerAndFollowStatus(sb, me);
+      return res.json({ ok: true, follows_owner: ownerState.followsOwner });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal follow' });
     }
@@ -1644,7 +1753,8 @@ async function startServer() {
         .eq('follower_id', me.id)
         .eq('following_id', targetId);
       if (error) throw error;
-      return res.json({ ok: true });
+      const ownerState = await resolveOwnerAndFollowStatus(sb, me);
+      return res.json({ ok: true, follows_owner: ownerState.followsOwner });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal unfollow' });
     }
@@ -1671,7 +1781,8 @@ async function startServer() {
         sb.from('follows').delete().eq('follower_id', targetId).eq('following_id', me.id),
       ]);
 
-      return res.json({ ok: true });
+      const ownerState = await resolveOwnerAndFollowStatus(sb, me);
+      return res.json({ ok: true, follows_owner: ownerState.followsOwner });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memblokir' });
     }

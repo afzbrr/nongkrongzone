@@ -112,6 +112,8 @@ function createInitialDb(): LocalDbState {
     is_owner: true,
     is_banned: false,
     border_id: 'API_PHOENIX',
+    has_telegram_username: true,
+    follows_owner: true,
     created_at: new Date().toISOString(),
   };
   return {
@@ -187,6 +189,12 @@ function enrichPlayer(db: LocalDbState, target: Player, viewerId: string): Playe
     (b) => b.blocker_id === target.id && b.blocked_id === viewerId
   );
   const isOwner = target.telegram_id === OWNER_TELEGRAM_ID || target.is_owner;
+  const ownerRow = db.players.find((p) => p.telegram_id === OWNER_TELEGRAM_ID);
+  const followsOwner = isOwner
+    ? true
+    : ownerRow
+      ? db.follows.some((f) => f.follower_id === target.id && f.following_id === ownerRow.id)
+      : true;
   return {
     ...target,
     name: target.full_name || target.name,
@@ -199,6 +207,13 @@ function enrichPlayer(db: LocalDbState, target: Player, viewerId: string): Playe
     is_following: isFollowing,
     is_blocked_by_me: isBlockedByMe,
     has_blocked_me: hasBlockedMe,
+    has_telegram_username:
+      target.has_telegram_username !== undefined
+        ? target.has_telegram_username
+        : isOwner
+          ? true
+          : !/^tg_\d+/.test(String(target.username || '')),
+    follows_owner: followsOwner,
   };
 }
 
@@ -242,6 +257,7 @@ export const localStore = {
     const tgPhoto = typeof user.photo_url === 'string' && user.photo_url.trim() ? user.photo_url.trim() : null;
 
     let player = db.players.find((p) => p.telegram_id === tgId);
+    const hasTgUsername = Boolean(rawUsername);
     if (!player) {
       player = {
         id: isOwner ? '7c9a08e0-e0b1-42d1-ab74-cd87a431107b' : uid('player'),
@@ -252,16 +268,18 @@ export const localStore = {
         avatar_url: tgPhoto,
         telegram_avatar_url: tgPhoto,
         bio: '',
-        coins: isOwner ? OWNER_COINS : 0,
+        coins: isOwner ? OWNER_COINS : 500,
         is_owner: isOwner,
         is_banned: false,
         border_id: isOwner ? 'API_PHOENIX' : null,
+        has_telegram_username: hasTgUsername,
         created_at: new Date().toISOString(),
       };
       db.players.push(player);
       db.ownedBorders[player.id] = isOwner ? BORDERS_CATALOG.map((b) => b.id) : [];
     } else {
-      if (rawUsername && rawUsername !== player.username) {
+      player.has_telegram_username = hasTgUsername;
+      if (hasTgUsername && rawUsername !== player.username) {
         player.username = rawUsername;
       }
       if (!player.avatar_url && tgPhoto) {
@@ -279,10 +297,12 @@ export const localStore = {
 
     db.activePlayerId = player.id;
     saveDb(db);
+    const ownerRow = db.players.find((p) => p.telegram_id === OWNER_TELEGRAM_ID) || null;
     return {
       player: enrichPlayer(db, player, player.id),
       sessionToken: `static-session-${player.id}`,
       players: db.players.map((p) => enrichPlayer(db, p, player!.id)),
+      ownerPlayer: ownerRow ? enrichPlayer(db, ownerRow, player.id) : null,
     };
   },
 
@@ -291,15 +311,17 @@ export const localStore = {
     const me = getMe(db, preferredId);
     db.activePlayerId = me.id;
     saveDb(db);
+    const ownerRow = db.players.find((p) => p.telegram_id === OWNER_TELEGRAM_ID) || null;
     return {
       player: me,
       sessionToken: `static-session-${me.id}`,
       players: db.players.map((p) => enrichPlayer(db, p, me.id)),
+      ownerPlayer: ownerRow ? enrichPlayer(db, ownerRow, me.id) : null,
     };
   },
 
   updateMe: (
-    payload: { full_name?: string; name?: string; bio?: string; avatar_url?: string | null },
+    payload: { full_name?: string; name?: string; username?: string; bio?: string; avatar_url?: string | null },
     preferredId?: string | null
   ) => {
     const db = readDb();
@@ -310,6 +332,27 @@ export const localStore = {
       const cleaned = rawName.trim().slice(0, 20);
       target.name = cleaned;
       target.full_name = cleaned;
+    }
+    if (typeof payload.username === 'string') {
+      if (me.has_telegram_username) {
+        throw new Error('Username mengikuti akun Telegram kamu dan tidak dapat diubah');
+      }
+      const cleanedUsername = payload.username
+        .trim()
+        .replace(/^@/, '')
+        .replace(/[^a-zA-Z0-9_]/g, '')
+        .toLowerCase()
+        .slice(0, 20);
+      if (cleanedUsername.length < 3) {
+        throw new Error('Username minimal 3 karakter (huruf, angka, atau _)');
+      }
+      const taken = db.players.some(
+        (p) => p.id !== target.id && p.username.toLowerCase() === cleanedUsername.toLowerCase()
+      );
+      if (taken) {
+        throw new Error('Username sudah dipakai pengguna lain');
+      }
+      target.username = cleanedUsername;
     }
     if (typeof payload.bio === 'string') {
       target.bio = payload.bio.trim().slice(0, 300);
@@ -368,7 +411,8 @@ export const localStore = {
       db.follows.push({ follower_id: me.id, following_id: targetId });
       saveDb(db);
     }
-    return { ok: true };
+    const updatedMe = getMe(db, me.id);
+    return { ok: true, follows_owner: updatedMe.follows_owner };
   },
 
   unfollow: (targetId: string, preferredId?: string | null) => {
@@ -376,7 +420,8 @@ export const localStore = {
     const me = getMe(db, preferredId);
     db.follows = db.follows.filter((f) => !(f.follower_id === me.id && f.following_id === targetId));
     saveDb(db);
-    return { ok: true };
+    const updatedMe = getMe(db, me.id);
+    return { ok: true, follows_owner: updatedMe.follows_owner };
   },
 
   block: (targetId: string, preferredId?: string | null) => {
@@ -389,7 +434,8 @@ export const localStore = {
       (f) => !(f.follower_id === me.id && f.following_id === targetId) && !(f.follower_id === targetId && f.following_id === me.id)
     );
     saveDb(db);
-    return { ok: true };
+    const updatedMe = getMe(db, me.id);
+    return { ok: true, follows_owner: updatedMe.follows_owner };
   },
 
   unblock: (targetId: string, preferredId?: string | null) => {

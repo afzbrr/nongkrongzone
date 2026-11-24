@@ -215,7 +215,7 @@ export const api = {
   telegramLogin: (payload: { initData?: string; user: TelegramWebAppUser }) =>
     withStaticFallback(
       () =>
-        apiFetch<{ player: Player; sessionToken: string; players: Player[] }>('/api/auth/telegram', {
+        apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>('/api/auth/telegram', {
           method: 'POST',
           body: JSON.stringify(payload),
         }),
@@ -232,7 +232,7 @@ export const api = {
     if (payload.user.photo_url) sp.set('photo_url', payload.user.photo_url);
     return withStaticFallback(
       () =>
-        apiFetch<{ player: Player; sessionToken: string; players: Player[] }>(
+        apiFetch<{ player: Player; sessionToken: string; players: Player[]; ownerPlayer?: Player | null }>(
           `/api/auth/telegram-login?${sp.toString()}`,
           { cache: 'no-store' }
         ),
@@ -243,13 +243,13 @@ export const api = {
   getMe: () =>
     withStaticFallback(
       () =>
-        apiFetch<{ player: Player; sessionToken?: string; players: Player[] }>('/api/auth/me', {
+        apiFetch<{ player: Player; sessionToken?: string; players: Player[]; ownerPlayer?: Player | null }>('/api/auth/me', {
           cache: 'no-store',
         }),
       () => localStore.getMe(activePlayerIdMemory)
     ),
 
-  updateMe: (payload: { full_name?: string; name?: string; bio?: string; avatar_url?: string | null }) =>
+  updateMe: (payload: { full_name?: string; name?: string; username?: string; bio?: string; avatar_url?: string | null }) =>
     withStaticFallback(
       () =>
         apiFetch<{ player: Player }>('/api/players/me', {
@@ -257,6 +257,7 @@ export const api = {
           body: JSON.stringify({
             ...(payload.full_name !== undefined ? { full_name: payload.full_name } : {}),
             ...(payload.name !== undefined ? { name: payload.name } : {}),
+            ...(payload.username !== undefined ? { username: payload.username } : {}),
             ...(payload.bio !== undefined ? { bio: payload.bio } : {}),
             ...(payload.avatar_url !== undefined ? { avatar_url: payload.avatar_url } : {}),
           }),
@@ -297,7 +298,7 @@ export const api = {
   follow: (target_player_id: string) =>
     withStaticFallback(
       () =>
-        apiFetch<{ ok: boolean }>('/api/follows', {
+        apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/follows', {
           method: 'POST',
           body: JSON.stringify({ target_player_id }),
         }),
@@ -306,14 +307,14 @@ export const api = {
 
   unfollow: (targetId: string) =>
     withStaticFallback(
-      () => apiFetch<{ ok: boolean }>(`/api/follows/${targetId}`, { method: 'DELETE' }),
+      () => apiFetch<{ ok: boolean; follows_owner?: boolean }>(`/api/follows/${targetId}`, { method: 'DELETE' }),
       () => localStore.unfollow(targetId, activePlayerIdMemory)
     ),
 
   block: (target_player_id: string) =>
     withStaticFallback(
       () =>
-        apiFetch<{ ok: boolean }>('/api/blocks', {
+        apiFetch<{ ok: boolean; follows_owner?: boolean }>('/api/blocks', {
           method: 'POST',
           body: JSON.stringify({ target_player_id }),
         }),

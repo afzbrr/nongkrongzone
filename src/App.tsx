@@ -28,6 +28,7 @@ import { BordersView } from './components/BordersView';
 import { ComingSoonView } from './components/ComingSoonView';
 import { BrandLogo } from './components/BrandLogo';
 import { SplashScreen } from './components/SplashScreen';
+import { FollowOwnerGate } from './components/FollowOwnerGate';
 
 type Tab = 'feed' | 'nobar' | 'game' | 'explore' | 'borders' | 'profile';
 
@@ -38,6 +39,7 @@ export default function App() {
   const [splashPhase, setSplashPhase] = useState<'showing' | 'fading' | 'done'>('showing');
 
   const [currentUser, setCurrentUser] = useState<Player | null>(null);
+  const [ownerPlayer, setOwnerPlayer] = useState<Player | null>(null);
   const [allPlayers, setAllPlayers] = useState<Player[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>('feed');
   const [viewingUsername, setViewingUsername] = useState<string | null>(null);
@@ -156,6 +158,7 @@ export default function App() {
       ? [tgUser?.first_name, tgUser?.last_name].filter(Boolean).join(' ').trim() || username
       : 'Faiz Ganteng';
 
+    const hasTgUsername = hasTg && Boolean(typeof tgUser?.username === 'string' && tgUser.username.trim());
     return {
       id: isOwner ? '7c9a08e0-e0b1-42d1-ab74-cd87a431107b' : hasTg ? `tg-${tgId}` : '00000000-0000-0000-0000-000000000001',
       telegram_id: hasTg ? tgId : 6189849073,
@@ -167,8 +170,10 @@ export default function App() {
       bio: '',
       is_owner: isOwner,
       is_banned: false,
-      coins: isOwner ? 999999999 : 0,
+      coins: isOwner ? 999999999 : 500,
       border_id: isOwner ? 'API_PHOENIX' : null,
+      has_telegram_username: hasTg ? hasTgUsername : true,
+      follows_owner: isOwner ? true : false,
       created_at: new Date().toISOString(),
     };
   }, []);
@@ -188,7 +193,7 @@ export default function App() {
       }
 
       const { initData, tgUser } = auth;
-      let meRes: { player: Player; sessionToken?: string; players: Player[] };
+      let meRes: { player: Player; sessionToken?: string; players: Player[]; ownerPlayer?: Player | null };
 
       if (tgUser?.id) {
         const payload = {
@@ -223,12 +228,25 @@ export default function App() {
       if (meRes.sessionToken) {
         setActiveSessionToken(meRes.sessionToken);
       }
-      setCurrentUser(meRes.player);
-      setAllPlayers(meRes.players || [meRes.player]);
+      const tgHasUser =
+        tgUser?.id ? Boolean(typeof tgUser?.username === 'string' && tgUser.username.trim()) : true;
+      const resolvedPlayer: Player = {
+        ...meRes.player,
+        has_telegram_username: meRes.player.has_telegram_username ?? tgHasUser,
+      };
+      const resolvedOwner =
+        meRes.ownerPlayer ||
+        (meRes.players || []).find((p) => p.is_owner || p.telegram_id === 6189849073) ||
+        null;
+      setOwnerPlayer(resolvedOwner);
+      setCurrentUser(resolvedPlayer);
+      setAllPlayers(meRes.players || [resolvedPlayer]);
       setBootState('ready');
 
-      // Load feed & notifications in background so feed issues never trap user on loading screen
-      Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
+      if (resolvedPlayer.is_owner || resolvedPlayer.follows_owner === true) {
+        // Load feed & notifications in background so feed issues never trap user on loading screen
+        Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
+      }
     } catch (err: any) {
       if (err?.code === 'SUPABASE_NOT_CONFIGURED') {
         resolvedByServerRef.current = true;
@@ -391,16 +409,24 @@ export default function App() {
     }
   };
 
-  const handleSwitchAccount = async (playerId: string) => {
-    setActiveSessionToken(null);
-    setActivePlayerId(playerId);
+  const handleOwnerUnfollowed = useCallback(() => {
     setViewingUsername(null);
+    setChatOpen(false);
+    setNotifOpen(false);
+    setCreateMode(null);
+    setCommentsPost(null);
+    setFocusedPost(null);
+    setStoryViewerIndex(null);
     setActiveTab('feed');
-    await bootstrap();
-  };
+    setCurrentUser((prev) => (prev && !prev.is_owner ? { ...prev, follows_owner: false } : prev));
+  }, []);
 
   const handleCurrentUserUpdated = (updated: Player) => {
-    setCurrentUser(updated);
+    setCurrentUser((prev) => ({
+      ...updated,
+      has_telegram_username: updated.has_telegram_username ?? prev?.has_telegram_username,
+      follows_owner: updated.follows_owner ?? prev?.follows_owner,
+    }));
     setAllPlayers((prev) => prev.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)));
     loadFeedAndStories();
   };
@@ -432,7 +458,14 @@ export default function App() {
   };
 
   const handleBlockUser = async (target: Player) => {
-    await api.block(target.id);
+    const res = await api.block(target.id);
+    if (
+      !currentUser?.is_owner &&
+      (res.follows_owner === false || target.is_owner || target.telegram_id === 6189849073)
+    ) {
+      handleOwnerUnfollowed();
+      return;
+    }
     await loadFeedAndStories();
   };
 
@@ -600,9 +633,32 @@ export default function App() {
     );
   }
 
+  const mustFollowOwner = Boolean(
+    currentUser && !currentUser.is_owner && currentUser.follows_owner !== true
+  );
+
   return (
     <BordersProvider playerId={currentUser.id}>
     {splashPhase !== 'done' && <SplashScreen fadingOut={splashPhase === 'fading'} />}
+    {mustFollowOwner ? (
+      <FollowOwnerGate
+        currentUser={currentUser}
+        ownerPlayer={ownerPlayer}
+        onFollowedOwner={(resolvedOwner) => {
+          setOwnerPlayer(resolvedOwner);
+          setCurrentUser((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  follows_owner: true,
+                  following_count: (prev.following_count || 0) + 1,
+                }
+              : prev
+          );
+          Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
+        }}
+      />
+    ) : (
     <div className="min-h-dvh flex justify-center" style={{ background: 'var(--nz-bg)', color: 'var(--nz-text)' }}>
       <div
         className="w-full max-w-[480px] min-h-dvh sm:border-x flex flex-col relative"
@@ -692,15 +748,14 @@ export default function App() {
             <ProfileView
               username={viewingUsername}
               currentUser={currentUser}
-              allPlayers={allPlayers}
               onBack={() => setViewingUsername(null)}
               onOpenProfile={handleOpenProfile}
               onOpenChatWith={(peer) => {
                 setChatInitialPeer(peer);
                 setChatOpen(true);
               }}
-              onSwitchAccount={handleSwitchAccount}
               onCurrentUserUpdated={handleCurrentUserUpdated}
+              onOwnerUnfollowed={handleOwnerUnfollowed}
               onOpenComments={setCommentsPost}
             />
           ) : activeTab === 'feed' ? (
@@ -775,14 +830,13 @@ export default function App() {
             <ProfileView
               username={currentUser.username}
               currentUser={currentUser}
-              allPlayers={allPlayers}
               onOpenProfile={handleOpenProfile}
               onOpenChatWith={(peer) => {
                 setChatInitialPeer(peer);
                 setChatOpen(true);
               }}
-              onSwitchAccount={handleSwitchAccount}
               onCurrentUserUpdated={handleCurrentUserUpdated}
+              onOwnerUnfollowed={handleOwnerUnfollowed}
               onOpenComments={setCommentsPost}
               onOpenBorders={() => {
                 setViewingUsername(null);
@@ -1008,6 +1062,7 @@ export default function App() {
         )}
       </div>
     </div>
+    )}
     </BordersProvider>
   );
 }

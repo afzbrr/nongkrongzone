@@ -18,6 +18,8 @@ export interface Player {
   is_following?: boolean;
   is_blocked_by_me?: boolean;
   has_blocked_me?: boolean;
+  has_telegram_username?: boolean;
+  follows_owner?: boolean;
 }
 
 export interface BorderItem {
