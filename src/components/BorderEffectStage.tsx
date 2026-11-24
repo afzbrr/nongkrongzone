@@ -3,6 +3,7 @@ import type { ResolvedBorderVisual } from '../utils/borderStyles';
 
 interface BorderEffectStageProps {
   visual: ResolvedBorderVisual;
+  paused?: boolean;
   children: React.ReactNode;
 }
 
@@ -257,27 +258,23 @@ const MoneyBillSvg: React.FC<{ className?: string }> = ({ className = 'w-6 h-4' 
   </svg>
 );
 
-export const BorderEffectStage: React.FC<BorderEffectStageProps> = ({ visual, children }) => {
+const BorderEffectStageComponent: React.FC<BorderEffectStageProps> = ({
+  visual,
+  paused = false,
+  children,
+}) => {
   const k = visual.effectKey;
 
   return (
-    <div
-      className="relative w-full h-[124px] flex items-center justify-center overflow-visible"
-      style={{ transformStyle: 'preserve-3d' }}
-    >
-      {/* AVATAR + 3-LAYER RING (Layer 1 & 2 & 3 at 0px, Avatar levitates at +40px inside Avatar.tsx) */}
-      <div
-        className="relative z-10 flex items-center justify-center"
-        style={{ transformStyle: 'preserve-3d' }}
-      >
-        {children}
-      </div>
+    <div className="relative w-full h-[124px] flex items-center justify-center overflow-visible">
+      {/* AVATAR + 3-LAYER RING */}
+      <div className="relative z-10 flex items-center justify-center">{children}</div>
 
-      {/* FOREGROUND DEPTH LAYER (translateZ 60px): 12-20 Particles + Named Mascots >= 24px */}
+      {/* FOREGROUND DEPTH LAYER: Particles + Named Mascots (rendered only when near/in viewport) */}
+      {!paused && (
       <div
         aria-hidden="true"
         className="absolute inset-0 pointer-events-none z-30 overflow-visible"
-        style={{ transform: 'translateZ(60px)', transformStyle: 'preserve-3d' }}
       >
         {/* 1. FAIZ GANTENG: Radial Golden Rays + 16 Dense Falling Gold & Purple Particles */}
         {k === 'faiz_owner' && (
@@ -1622,7 +1619,10 @@ export const BorderEffectStage: React.FC<BorderEffectStageProps> = ({ visual, ch
           </>
         )}
       </div>
+      )}
     </div>
   );
 };
+
+export const BorderEffectStage = React.memo(BorderEffectStageComponent);
 

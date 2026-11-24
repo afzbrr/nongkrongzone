@@ -666,7 +666,7 @@ export default function App() {
       >
         {/* Clean 48px Header: NONGKRONG ZONE. left, Notif + Chat right */}
         <header
-          className="sticky top-0 z-30 h-[48px] px-4 backdrop-blur-md border-b flex items-center justify-between"
+          className="sticky top-0 z-30 h-[48px] px-4 border-b flex items-center justify-between"
           style={{ background: 'var(--nz-header-bg)', borderColor: 'var(--nz-border)' }}
         >
           <button
@@ -848,7 +848,7 @@ export default function App() {
 
         {/* Bottom Navigation Bar: Home | Nobar | Post (+) | Game | Profil */}
         <nav
-          className="sticky bottom-0 z-30 backdrop-blur-md border-t pb-safe"
+          className="sticky bottom-0 z-30 border-t pb-safe"
           style={{ background: 'var(--nz-header-bg)', borderColor: 'var(--nz-border)' }}
         >
           <div className="grid grid-cols-5 h-[56px] items-center">

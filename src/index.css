@@ -30,7 +30,6 @@
 
   html, body {
     background: var(--nz-bg);
-    background-attachment: fixed;
     color: var(--nz-text);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     font-size: 14px;
@@ -164,10 +163,10 @@
 
 @keyframes avatar-float-pulse {
   0%, 100% {
-    transform: translateZ(40px) scale(1);
+    transform: scale(1);
   }
   50% {
-    transform: translateZ(44px) scale(1.03);
+    transform: scale(1.03);
   }
 }
 
@@ -396,8 +395,17 @@
   }
 }
 
+.nz-border-card {
+  contain: layout style paint;
+}
+
+.nz-paused,
+.nz-paused * {
+  animation-play-state: paused !important;
+}
+
 .nz-card-enter {
-  animation: card-enter 0.42s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: card-enter 0.36s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 .nz-spin-2s {

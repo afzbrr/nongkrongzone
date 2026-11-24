@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Check, Coins, Crown, Lock } from 'lucide-react';
 import type { BorderItem, Player } from '../types';
 import { api } from '../services/api';
@@ -8,6 +8,30 @@ import { formatNumber } from '../utils/format';
 import { Avatar } from './Avatar';
 import { BorderEffectStage } from './BorderEffectStage';
 import { CoinDisplay } from './PlayerBadges';
+
+type VisibilityListener = (visible: boolean) => void;
+const observerListeners = new WeakMap<Element, VisibilityListener>();
+let sharedCardObserver: IntersectionObserver | null = null;
+
+function getSharedCardObserver(): IntersectionObserver | null {
+  if (typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') {
+    return null;
+  }
+  if (!sharedCardObserver) {
+    sharedCardObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const cb = observerListeners.get(entry.target);
+          if (cb) {
+            cb(entry.isIntersecting);
+          }
+        }
+      },
+      { rootMargin: '180px 0px', threshold: 0.01 }
+    );
+  }
+  return sharedCardObserver;
+}
 
 interface BordersViewProps {
   currentUser: Player;
@@ -57,7 +81,7 @@ interface BorderCard3DProps {
   onBuy: (b: BorderItem) => void;
 }
 
-const BorderCard3D: React.FC<BorderCard3DProps> = ({
+const BorderCard3D: React.FC<BorderCard3DProps> = React.memo(({
   border,
   index,
   activeTab,
@@ -68,7 +92,9 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
   onEquip,
   onBuy,
 }) => {
+  const outerRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
+  const [isInView, setIsInView] = useState(() => index < 6);
   const [tilt, setTilt] = useState<{ rx: number; ry: number; active: boolean }>({
     rx: 0,
     ry: 0,
@@ -77,8 +103,23 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
   const [tapBurstKey, setTapBurstKey] = useState(0);
   const [isBouncing, setIsBouncing] = useState(false);
 
-  const visual = resolveBorderVisual(border);
+  const visual = useMemo(() => resolveBorderVisual(border), [border]);
   const isOwnerBorder = visual.isOwnerBadge;
+
+  useEffect(() => {
+    const el = outerRef.current;
+    const observer = getSharedCardObserver();
+    if (!el || !observer) {
+      setIsInView(true);
+      return;
+    }
+    observerListeners.set(el, setIsInView);
+    observer.observe(el);
+    return () => {
+      observer.unobserve(el);
+      observerListeners.delete(el);
+    };
+  }, []);
 
   const updateTiltFromClientPoint = (clientX: number, clientY: number) => {
     const el = cardRef.current;
@@ -97,75 +138,79 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
   };
 
   const resetTilt = () => {
-    setTilt({ rx: 0, ry: 0, active: false });
+    setTilt((prev) => (prev.active ? { rx: 0, ry: 0, active: false } : prev));
   };
 
   const triggerTapFeedback = () => {
     setTapBurstKey((prev) => prev + 1);
     setIsBouncing(true);
-    setTimeout(() => setIsBouncing(false), 240);
+    setTimeout(() => setIsBouncing(false), 220);
   };
 
-  const scaleVal = isBouncing ? 1.05 : tilt.active ? 1.02 : 1;
+  const scaleVal = isBouncing ? 1.04 : tilt.active ? 1.02 : 1;
+  const paused = !isInView;
 
   return (
     <div
-      className="nz-card-enter"
+      ref={outerRef}
+      className={`nz-border-card nz-card-enter ${paused ? 'nz-paused' : ''}`}
       style={{
-        perspective: '1000px',
-        animationDelay: `${index * 50}ms`,
+        perspective: tilt.active ? '1000px' : undefined,
+        animationDelay: `${Math.min(index, 5) * 35}ms`,
       }}
     >
       <div
         ref={cardRef}
-        onMouseMove={(e) => updateTiltFromClientPoint(e.clientX, e.clientY)}
-        onMouseLeave={resetTilt}
-        onTouchStart={(e) => {
-          const touch = e.touches[0];
-          if (touch) updateTiltFromClientPoint(touch.clientX, touch.clientY);
-          triggerTapFeedback();
+        onPointerMove={(e) => {
+          if (e.pointerType === 'mouse') {
+            updateTiltFromClientPoint(e.clientX, e.clientY);
+          }
         }}
-        onTouchMove={(e) => {
-          const touch = e.touches[0];
-          if (touch) updateTiltFromClientPoint(touch.clientX, touch.clientY);
+        onPointerLeave={(e) => {
+          if (e.pointerType === 'mouse') {
+            resetTilt();
+          }
         }}
-        onTouchEnd={resetTilt}
         onClick={triggerTapFeedback}
         style={{
           background: visual.cardBgGradient,
-          transform: `rotateX(${tilt.rx}deg) rotateY(${tilt.ry}deg) scale(${scaleVal})`,
-          transformStyle: 'preserve-3d',
+          transform:
+            tilt.active || isBouncing
+              ? `rotateX(${tilt.rx}deg) rotateY(${tilt.ry}deg) scale(${scaleVal})`
+              : undefined,
           transition: tilt.active
             ? 'transform 60ms linear, box-shadow 220ms ease'
-            : 'transform 360ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms ease',
+            : 'transform 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 220ms ease',
           boxShadow:
             tilt.active || equipped
               ? visual.cardHoverShadow
-              : `0 6px 18px rgba(0,0,0,0.28), 0 0 12px ${visual.primaryColor}22`,
+              : `0 6px 16px rgba(0,0,0,0.26), 0 0 10px ${visual.primaryColor}20`,
         }}
         className={`relative text-[#111113] rounded-2xl p-4 flex flex-col items-center text-center gap-2.5 overflow-hidden select-none ${
           equipped ? 'ring-2 ring-[#8B5CF6]' : 'border border-black/10'
         }`}
       >
-        {/* Subtle Soft Bokeh Circles */}
+        {/* Subtle Soft Bokeh Circles (pre-feathered radial gradients — zero Gaussian blur cost) */}
         <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
           <span
-            className="absolute -top-6 -right-6 w-20 h-20 rounded-full blur-xl"
-            style={{ background: visual.bokehTint }}
+            className="absolute -top-8 -right-8 w-28 h-28 rounded-full"
+            style={{ background: `radial-gradient(circle, ${visual.bokehTint} 0%, transparent 70%)` }}
           />
           <span
-            className="absolute -bottom-6 -left-6 w-24 h-24 rounded-full blur-xl"
-            style={{ background: visual.bokehTint }}
+            className="absolute -bottom-8 -left-8 w-32 h-32 rounded-full"
+            style={{ background: `radial-gradient(circle, ${visual.bokehTint} 0%, transparent 70%)` }}
           />
         </div>
 
-        {/* Diagonal Glass Reflection Shine Sweeping Every ~2s */}
-        <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden z-[1]">
-          <div
-            className="w-16 h-[160%] -top-[30%] bg-gradient-to-r from-transparent via-white/70 to-transparent nz-glass-sweep"
-            style={{ position: 'absolute', left: 0 }}
-          />
-        </div>
+        {/* Diagonal Glass Reflection Shine on Equipped or Hovered Card */}
+        {(equipped || tilt.active) && isInView && (
+          <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden z-[1]">
+            <div
+              className="w-16 h-[160%] -top-[30%] bg-gradient-to-r from-transparent via-white/70 to-transparent nz-glass-sweep"
+              style={{ position: 'absolute', left: 0 }}
+            />
+          </div>
+        )}
 
         {/* Mini Tap Particle Burst */}
         {tapBurstKey > 0 && (
@@ -193,11 +238,11 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
         )}
 
         {/* 3D Animated Avatar Preview Stage */}
-        <BorderEffectStage visual={visual}>
-          <Avatar player={currentUser} size={72} overrideBorder={border} use3dFloat />
+        <BorderEffectStage visual={visual} paused={paused}>
+          <Avatar player={currentUser} size={72} overrideBorder={border} use3dFloat paused={paused} />
         </BorderEffectStage>
 
-        <div className="relative z-10 min-w-0 w-full" style={{ transform: 'translateZ(20px)' }}>
+        <div className="relative z-10 min-w-0 w-full">
           {(() => {
             const catLower = String(border.category || '').toLowerCase();
             const idUpper = String(border.id || '').toUpperCase();
@@ -239,7 +284,7 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
           })()}
         </div>
 
-        <div className="relative z-10 w-full mt-auto pt-1" style={{ transform: 'translateZ(20px)' }}>
+        <div className="relative z-10 w-full mt-auto pt-1">
           {equipped ? (
             <div className="w-full h-8 rounded-xl bg-[#EEF2FF] text-[#6D28D9] text-[12px] font-semibold flex items-center justify-center gap-1">
               <Check className="w-3.5 h-3.5" strokeWidth={2} />
@@ -329,7 +374,7 @@ const BorderCard3D: React.FC<BorderCard3DProps> = ({
       </div>
     </div>
   );
-};
+});
 
 export const BordersView: React.FC<BordersViewProps> = ({
   currentUser,
@@ -344,15 +389,17 @@ export const BordersView: React.FC<BordersViewProps> = ({
   const [toast, setToast] = useState<{ text: string; type: 'ok' | 'err' } | null>(null);
 
   useEffect(() => {
-    refreshBorders();
-  }, [refreshBorders]);
+    if (allBorders.length === 0 && !loading) {
+      refreshBorders();
+    }
+  }, [allBorders.length, loading, refreshBorders]);
 
-  const showToast = (text: string, type: 'ok' | 'err' = 'ok') => {
+  const showToast = useCallback((text: string, type: 'ok' | 'err' = 'ok') => {
     setToast({ text, type });
     setTimeout(() => {
       setToast((prev) => (prev?.text === text ? null : prev));
     }, 2800);
-  };
+  }, []);
 
   const isBorderOwned = (b: BorderItem) => {
     return Boolean(currentUser.is_owner || b.owned || ownedIds.has(String(b.id)));
@@ -400,44 +447,50 @@ export const BordersView: React.FC<BordersViewProps> = ({
     });
   }, [allBorders, collectionBorders, activeTab, selectedCategory, ownedIds, currentUser.is_owner]);
 
-  const handleBuy = async (border: BorderItem) => {
-    if (busyId) return;
-    if (currentUser.is_owner) {
-      await handleEquip(border);
-      return;
-    }
-    if (Number(currentUser.coins || 0) < Number(border.price_coins || 0)) {
-      showToast('Coin tidak cukup', 'err');
-      return;
-    }
+  const handleEquip = useCallback(
+    async (border: BorderItem) => {
+      if (busyId) return;
+      setBusyId(border.id);
+      try {
+        const res = await api.equipBorder(border.id);
+        onPlayerUpdated(res.player);
+        await refreshBorders();
+        showToast(`Border ${border.name} dipakai`, 'ok');
+      } catch (err: any) {
+        showToast(err?.message || 'Gagal memakai border', 'err');
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [busyId, onPlayerUpdated, refreshBorders, showToast]
+  );
 
-    setBusyId(border.id);
-    try {
-      const res = await api.buyBorder(border.id);
-      onPlayerUpdated({ ...currentUser, coins: res.coins });
-      await refreshBorders();
-      showToast(`Berhasil membeli ${border.name}`, 'ok');
-    } catch (err: any) {
-      showToast(err?.message || 'Coin tidak cukup', 'err');
-    } finally {
-      setBusyId(null);
-    }
-  };
+  const handleBuy = useCallback(
+    async (border: BorderItem) => {
+      if (busyId) return;
+      if (currentUser.is_owner) {
+        await handleEquip(border);
+        return;
+      }
+      if (Number(currentUser.coins || 0) < Number(border.price_coins || 0)) {
+        showToast('Coin tidak cukup', 'err');
+        return;
+      }
 
-  const handleEquip = async (border: BorderItem) => {
-    if (busyId) return;
-    setBusyId(border.id);
-    try {
-      const res = await api.equipBorder(border.id);
-      onPlayerUpdated(res.player);
-      await refreshBorders();
-      showToast(`Border ${border.name} dipakai`, 'ok');
-    } catch (err: any) {
-      showToast(err?.message || 'Gagal memakai border', 'err');
-    } finally {
-      setBusyId(null);
-    }
-  };
+      setBusyId(border.id);
+      try {
+        const res = await api.buyBorder(border.id);
+        onPlayerUpdated({ ...currentUser, coins: res.coins });
+        await refreshBorders();
+        showToast(`Berhasil membeli ${border.name}`, 'ok');
+      } catch (err: any) {
+        showToast(err?.message || 'Coin tidak cukup', 'err');
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [busyId, currentUser, handleEquip, onPlayerUpdated, refreshBorders, showToast]
+  );
 
   return (
     <div className="w-full pb-20">

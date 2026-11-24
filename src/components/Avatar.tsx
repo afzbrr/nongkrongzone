@@ -10,51 +10,60 @@ interface AvatarProps {
   storyRing?: 'unseen' | 'seen' | 'none';
   overrideBorder?: BorderItem | null;
   use3dFloat?: boolean;
+  paused?: boolean;
   onClick?: () => void;
   className?: string;
 }
 
-export const Avatar: React.FC<AvatarProps> = ({
+const AvatarComponent: React.FC<AvatarProps> = ({
   player,
   size = 36,
   storyRing = 'none',
   overrideBorder,
   use3dFloat = false,
+  paused = false,
   onClick,
   className = '',
 }) => {
   const { bordersById } = useBorders();
   const safeSrc = sanitizeMediaUrl(player?.avatar_url);
   const isOwner = Boolean(player?.is_owner);
+  const playerBorderId = player?.border_id;
 
-  const activeBorder =
-    overrideBorder !== undefined
-      ? overrideBorder
-      : player?.border_id
-        ? bordersById.get(String(player.border_id)) ||
-          (isOwner && String(player.border_id).toUpperCase() === 'FAIZ_SPIDERMAN'
-            ? {
-                id: 'FAIZ_SPIDERMAN',
-                name: 'FAIZ SPIDERMAN',
-                category: 'OWNER',
-                price_coins: 0,
-                is_owner_only: true,
-                css_ring: null,
-                icon_emoji: null,
-              }
-            : isOwner
-              ? bordersById.get('FAIZ_OWNER') ||
-                Array.from(bordersById.values()).find((b) => b.is_owner_only) ||
-                null
-              : null)
-        : isOwner
-          ? bordersById.get('FAIZ_OWNER') ||
-            Array.from(bordersById.values()).find((b) => b.is_owner_only) ||
-            null
-          : null;
+  const activeBorder = React.useMemo(() => {
+    if (overrideBorder !== undefined) return overrideBorder;
+    if (playerBorderId) {
+      return (
+        bordersById.get(String(playerBorderId)) ||
+        (isOwner && String(playerBorderId).toUpperCase() === 'FAIZ_SPIDERMAN'
+          ? {
+              id: 'FAIZ_SPIDERMAN',
+              name: 'FAIZ SPIDERMAN',
+              category: 'OWNER',
+              price_coins: 0,
+              is_owner_only: true,
+              css_ring: null,
+              icon_emoji: null,
+            }
+          : isOwner
+            ? bordersById.get('FAIZ_OWNER') ||
+              Array.from(bordersById.values()).find((b) => b.is_owner_only) ||
+              null
+            : null)
+      );
+    }
+    return isOwner
+      ? bordersById.get('FAIZ_OWNER') ||
+        Array.from(bordersById.values()).find((b) => b.is_owner_only) ||
+        null
+      : null;
+  }, [overrideBorder, playerBorderId, bordersById, isOwner]);
 
   const isPreviewMode = overrideBorder !== undefined;
-  const visual = resolveBorderVisual(activeBorder, !isPreviewMode && isOwner && !player?.border_id);
+  const visual = React.useMemo(
+    () => resolveBorderVisual(activeBorder, !isPreviewMode && isOwner && !playerBorderId),
+    [activeBorder, isPreviewMode, isOwner, playerBorderId]
+  );
 
   const sizeStyle: React.CSSProperties = {
     width: `${size}px`,
@@ -198,7 +207,6 @@ export const Avatar: React.FC<AvatarProps> = ({
       style={{
         width: `${outerSize}px`,
         height: `${outerSize}px`,
-        transformStyle: 'preserve-3d',
       }}
       className={`relative inline-flex items-center justify-center shrink-0 ${className}`}
     >
@@ -208,47 +216,44 @@ export const Avatar: React.FC<AvatarProps> = ({
           aria-hidden="true"
           className="absolute -bottom-3.5 left-1/2 -translate-x-1/2 w-[78%] h-3 rounded-full pointer-events-none"
           style={{
-            background: 'radial-gradient(ellipse, rgba(0,0,0,0.45) 0%, transparent 72%)',
-            filter: 'blur(4px)',
-            transform: 'translateZ(-10px)',
+            background: 'radial-gradient(ellipse, rgba(0,0,0,0.42) 0%, transparent 72%)',
           }}
         />
       )}
 
-      {/* RING DEPTH LAYER (translateZ 0px): Layer 1 Glow Blur + Layer 2 Thick 8-10px Conic + Ring-Only Pattern + Layer 3 Thin Outer Spin */}
+      {/* RING DEPTH LAYER: Layer 1 Soft Radial Glow + Layer 2 Thick 8-10px Conic + Ring-Only Pattern + Layer 3 Thin Outer Spin */}
       <div
         style={{
           position: 'absolute',
           inset: 0,
-          transform: use3dFloat ? 'translateZ(0px)' : undefined,
-          transformStyle: 'preserve-3d',
           animation:
-            visual.effectKey === 'basket'
+            !paused && visual.effectKey === 'basket'
               ? 'dribble-bounce 0.95s ease-in-out infinite'
-              : visual.effectKey === 'voli'
+              : !paused && visual.effectKey === 'voli'
                 ? 'float-ring 2s ease-in-out infinite'
                 : undefined,
         }}
         className="flex items-center justify-center pointer-events-none"
       >
-        {/* LAYER 1: Glow Blur Behind (blur 12px, opacity 0.85) */}
+        {/* LAYER 1: Soft Pre-Feathered Glow Behind (zero GPU blur pass) */}
         <div
           aria-hidden="true"
-          className={`absolute -inset-2.5 rounded-full ${
-            visual.isHeartbeat
-              ? 'nz-heartbeat'
-              : visual.isAurora
-                ? 'nz-hue-rotate nz-pulse-glow'
-                : 'nz-pulse-glow'
+          className={`absolute -inset-3 rounded-full ${
+            paused
+              ? ''
+              : visual.isHeartbeat
+                ? 'nz-heartbeat'
+                : visual.isAurora
+                  ? 'nz-hue-rotate nz-pulse-glow'
+                  : 'nz-pulse-glow'
           }`}
           style={{
             background: visual.ambientGlowBg,
-            filter: 'blur(12px)',
-            opacity: 0.85,
+            opacity: 0.78,
             animation:
-              visual.effectKey === 'faiz_spiderman'
+              !paused && visual.effectKey === 'faiz_spiderman'
                 ? 'glow-red-blue 2.6s ease-in-out infinite'
-                : visual.effectKey === 'esport'
+                : !paused && visual.effectKey === 'esport'
                   ? 'neon-blink 1.4s ease-in-out infinite'
                   : undefined,
           }}
@@ -263,7 +268,7 @@ export const Avatar: React.FC<AvatarProps> = ({
             borderWidth: size >= 56 ? '2px' : '1.5px',
             borderStyle: visual.outerRingPattern,
             borderColor: visual.outerRingColor,
-            filter: `drop-shadow(0 0 6px ${visual.primaryColor})`,
+            filter: paused ? undefined : `drop-shadow(0 0 5px ${visual.primaryColor})`,
           }}
           className={`absolute rounded-full opacity-90 ${visual.outerSpinClass}`}
         />
@@ -274,7 +279,7 @@ export const Avatar: React.FC<AvatarProps> = ({
             aria-hidden="true"
             viewBox="0 0 100 100"
             className={`absolute inset-0 w-full h-full ${visual.spinClass}`}
-            style={{ filter: `drop-shadow(0 0 8px ${visual.primaryColor})` }}
+            style={{ filter: paused ? undefined : `drop-shadow(0 0 6px ${visual.primaryColor})` }}
           >
             <circle
               cx="50"
@@ -1024,16 +1029,14 @@ export const Avatar: React.FC<AvatarProps> = ({
         />
       </div>
 
-      {/* AVATAR FLOATING LAYER (translateZ 40px) */}
+      {/* AVATAR FLOATING LAYER */}
       <div
         className={`relative rounded-full bg-[#0B0B0D] flex items-center justify-center z-[5] ${
-          use3dFloat ? 'nz-avatar-float' : ''
+          use3dFloat && !paused ? 'nz-avatar-float' : ''
         }`}
         style={{
           width: `${size}px`,
           height: `${size}px`,
-          transform: use3dFloat ? 'translateZ(40px)' : undefined,
-          transformStyle: 'preserve-3d',
           boxShadow: use3dFloat ? '0 8px 18px rgba(0,0,0,0.45)' : undefined,
         }}
       >
@@ -1319,3 +1322,5 @@ export const Avatar: React.FC<AvatarProps> = ({
 
   return renderedAvatar;
 };
+
+export const Avatar = React.memo(AvatarComponent);
