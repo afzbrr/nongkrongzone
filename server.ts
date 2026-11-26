@@ -6,16 +6,28 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { createServer as createViteServer } from 'vite';
 
 const PORT = Number(process.env.PORT) || 3000;
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.IS_SERVERLESS === 'true'
+);
 const OWNER_TELEGRAM_ID = 6189849073;
 const OWNER_DEFAULT_USERNAME = 'istamina';
 const OWNER_NAME = 'Faiz Ganteng';
 const OWNER_COINS = 999999999;
 const OWNER_BORDER = 'FAIZ_OWNER';
-const SESSION_SECRET =
-  (process.env.SESSION_SECRET || '').trim() || crypto.randomBytes(32).toString('hex');
+const runtimeSecretSeed = (
+  process.env.SESSION_SECRET ||
+  process.env.TELEGRAM_BOT_TOKEN ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  ''
+).trim();
+const SESSION_SECRET = runtimeSecretSeed
+  ? crypto.createHmac('sha256', runtimeSecretSeed).update('nongkrong-zone-session-v1').digest('hex')
+  : crypto.randomBytes(32).toString('hex');
 
 const telegramAvatarMemoryCache = new Map<string, string>();
 const telegramHasUsernameCache = new Map<string, boolean>();
@@ -412,7 +424,9 @@ async function recordTransferTransaction(
   return false;
 }
 
-const OWNER_PANEL_DATA_DIR = path.resolve(process.cwd(), 'data');
+const OWNER_PANEL_DATA_DIR = IS_SERVERLESS
+  ? path.resolve('/tmp', 'nz-data')
+  : path.resolve(process.cwd(), 'data');
 const OWNER_PANEL_STORE_PATH = path.resolve(OWNER_PANEL_DATA_DIR, 'owner-panel.json');
 
 interface BroadcastRow {
@@ -479,10 +493,14 @@ function readOwnerPanelFallback(): OwnerPanelFallbackData {
 }
 
 function writeOwnerPanelFallback(data: OwnerPanelFallbackData) {
-  fs.mkdirSync(OWNER_PANEL_DATA_DIR, { recursive: true });
-  const tmpPath = `${OWNER_PANEL_STORE_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmpPath, OWNER_PANEL_STORE_PATH);
+  try {
+    fs.mkdirSync(OWNER_PANEL_DATA_DIR, { recursive: true });
+    const tmpPath = `${OWNER_PANEL_STORE_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpPath, OWNER_PANEL_STORE_PATH);
+  } catch {
+    // Non-fatal on read-only serverless filesystems
+  }
 }
 
 const dropLockQueues = new Map<string, Promise<any>>();
@@ -634,9 +652,15 @@ function verifyTelegramInitData(initData: string, rawBotToken: string): { ok: bo
   }
 }
 
-const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const UPLOADS_DIR = IS_SERVERLESS
+  ? path.resolve('/tmp', 'nz-uploads')
+  : path.resolve(process.cwd(), 'uploads');
+try {
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  }
+} catch {
+  // Ignore on read-only environments
 }
 
 const tgAvatarFetchCache = new Map<number, { ts: number; url: string | null }>();
@@ -727,11 +751,15 @@ async function fetchTelegramAvatarFromBotApi(
       // fall back to local /uploads
     }
 
-    if (!publicUrl) {
-      const targetPath = path.resolve(UPLOADS_DIR, filename);
-      if (targetPath.startsWith(UPLOADS_DIR + path.sep)) {
-        fs.writeFileSync(targetPath, buffer);
-        publicUrl = `/uploads/${filename}`;
+    if (!publicUrl && !IS_SERVERLESS) {
+      try {
+        const targetPath = path.resolve(UPLOADS_DIR, filename);
+        if (targetPath.startsWith(UPLOADS_DIR + path.sep)) {
+          fs.writeFileSync(targetPath, buffer);
+          publicUrl = `/uploads/${filename}`;
+        }
+      } catch {
+        // Ignore local fallback write failures
       }
     }
 
@@ -1095,9 +1123,19 @@ async function resolveOwnerAndFollowStatus(sb: SupabaseClient, viewer: any) {
   return { ownerPlayer: normalizedOwner, followsOwner };
 }
 
-async function startServer() {
+let cachedAppPromise: Promise<express.Express> | null = null;
+
+export async function createApp(): Promise<express.Express> {
+  if (cachedAppPromise) return cachedAppPromise;
+  cachedAppPromise = (async () => {
   const app = express();
   app.set('trust proxy', 1);
+  app.use((req: any, _res: Response, next: (e?: any) => void) => {
+    if (req.body !== undefined && !req._body) {
+      req._body = true;
+    }
+    return next();
+  });
   app.use(express.json({ limit: '75mb' }));
   app.use((err: any, _req: Request, res: Response, next: (e?: any) => void) => {
     if (err instanceof SyntaxError && 'body' in err) {
@@ -1189,6 +1227,15 @@ async function startServer() {
         }
       }
 
+      if (IS_SERVERLESS) {
+        return res.status(500).json({
+          error: storageErrorMsg || 'Bucket Supabase Storage (media) belum tersedia untuk upload',
+        });
+      }
+
+      if (!fs.existsSync(UPLOADS_DIR)) {
+        fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      }
       const targetPath = path.resolve(UPLOADS_DIR, fileName);
       if (!targetPath.startsWith(UPLOADS_DIR + path.sep)) {
         return res.status(400).json({ error: 'Invalid filename' });
@@ -4623,6 +4670,14 @@ async function startServer() {
     }
   });
 
+  return app;
+  })();
+  return cachedAppPromise;
+}
+
+async function startServer() {
+  const app = await createApp();
+
   // Vite or Static production serving
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
@@ -4634,6 +4689,7 @@ async function startServer() {
       return res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -4686,7 +4742,9 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!IS_SERVERLESS) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

@@ -407,8 +407,31 @@ export default function App() {
           setMissingEnv(['SUPABASE_URL', 'SUPABASE_ANON_KEY']);
           setBootState('unconfigured');
         } else if (err?.isSpaFallbackHtml) {
-          resolvedByServerRef.current = true;
-          setBootState('static_host');
+          try {
+            const h = await api.health();
+            if (!h.supabaseConfigured) {
+              resolvedByServerRef.current = true;
+              setMissingEnv(h.missing?.length ? h.missing : ['SUPABASE_URL', 'SUPABASE_ANON_KEY']);
+              setBootState('unconfigured');
+              return;
+            }
+            if (!backgroundRefresh) {
+              setBootError('Server API merespons halaman HTML. Silakan coba muat ulang.');
+              setBootState('error');
+            }
+            return;
+          } catch (healthErr: any) {
+            if (healthErr?.isSpaFallbackHtml) {
+              resolvedByServerRef.current = true;
+              setBootState('static_host');
+              return;
+            }
+            if (!backgroundRefresh) {
+              setBootError(healthErr?.message || 'Gagal terhubung ke server API');
+              setBootState('error');
+            }
+            return;
+          }
         } else if (err?.code === 'TELEGRAM_AUTH_REQUIRED' || err?.status === 401) {
           resolvedByServerRef.current = true;
           setBootState('telegram_required');
@@ -492,12 +515,20 @@ export default function App() {
     if (!currentUser?.id || isStaticSpaHost()) return;
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let wsOpened = false;
+    let wsFailures = 0;
 
     const connect = () => {
+      if (closedByCleanup) return;
       try {
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${proto}//${window.location.host}/ws?playerId=${currentUser.id}`);
         wsRef.current = ws;
+
+        ws.onopen = () => {
+          wsOpened = true;
+          wsFailures = 0;
+        };
 
         ws.onmessage = (e) => {
           try {
@@ -577,7 +608,8 @@ export default function App() {
         };
 
         ws.onclose = () => {
-          if (!closedByCleanup) {
+          wsFailures += 1;
+          if (!closedByCleanup && (wsOpened || wsFailures < 2)) {
             reconnectTimer = setTimeout(connect, 2500);
           }
         };
