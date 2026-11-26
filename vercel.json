@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": "/api/index?__nz_path=$1"
+    },
+    {
       "source": "/((?!api(?:/|$)|uploads(?:/|$)|assets(?:/|$)).*)",
       "destination": "/index.html"
     }
