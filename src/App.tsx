@@ -327,7 +327,9 @@ export default function App() {
           typeof window !== 'undefined' &&
           (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
         const isFramed = typeof window !== 'undefined' && window.self !== window.top;
-        const allowOwnerPreview = !auth.isTelegramEnv && (isLocalHost || isFramed);
+        const ref = typeof document !== 'undefined' ? document.referrer || '' : '';
+        const isStudioFrame = isFramed && (!ref || /aistudio\.google|googleusercontent\.com|localhost/i.test(ref));
+        const allowOwnerPreview = !auth.isTelegramEnv && (isLocalHost || isStudioFrame);
         setNoOwnerFallback(!allowOwnerPreview);
 
         const { initData, tgUser } = auth;
@@ -359,6 +361,7 @@ export default function App() {
             if (
               postErr?.code === 'SUPABASE_NOT_CONFIGURED' ||
               postErr?.status === 401 ||
+              postErr?.status === 400 ||
               postErr?.isSpaFallbackHtml
             ) {
               throw postErr;
