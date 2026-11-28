@@ -10,6 +10,9 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 const PORT = Number(process.env.PORT) || 3000;
 const IS_SERVERLESS = Boolean(
   process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.VERCEL_URL ||
+    process.env.NOW_REGION ||
     process.env.AWS_LAMBDA_FUNCTION_NAME ||
     process.env.IS_SERVERLESS === 'true'
 );
@@ -4750,6 +4753,13 @@ export async function createApp(): Promise<express.Express> {
     }
   });
 
+  app.use((err: any, _req: Request, res: Response, _next: (e?: any) => void) => {
+    console.error('[express error]', err);
+    if (res.headersSent) return;
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    return res.status(status).json({ error: err?.message || 'Internal server error' });
+  });
+
   return app;
   })();
   return cachedAppPromise;
@@ -4769,7 +4779,8 @@ async function startServer() {
       return res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
-    const { createServer: createViteServer } = await import('vite');
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
