@@ -75,6 +75,9 @@ export default function App() {
   const [allPlayers, setAllPlayers] = useState<Player[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>('feed');
   const [viewingUsername, setViewingUsername] = useState<string | null>(null);
+  const [isTelegramMiniApp, setIsTelegramMiniApp] = useState(false);
+  const isTelegramMiniAppRef = useRef(false);
+  const [chromeBannerDismissed, setChromeBannerDismissed] = useState(false);
 
   // Feed & Stories
   const [posts, setPosts] = useState<Post[]>([]);
@@ -121,17 +124,19 @@ export default function App() {
   const openTransferModal = useCallback(
     (recipient?: Player | null) => {
       if (currentUser?.is_guest) {
-        showTransferToast({
-          id: `tg-only-${Date.now()}`,
-          kind: 'sent',
-          text: 'Buka NONGKRONG ZONE lewat Bot Telegram untuk transfer coin.',
-        });
+        if (!isTelegramMiniApp) {
+          showTransferToast({
+            id: `tg-only-${Date.now()}`,
+            kind: 'sent',
+            text: 'Buka NONGKRONG ZONE lewat Bot Telegram untuk fitur ini.',
+          });
+        }
         return;
       }
       setTransferInitialRecipient(recipient ?? null);
       setTransferOpen(true);
     },
-    [currentUser?.is_guest, showTransferToast]
+    [currentUser?.is_guest, isTelegramMiniApp, showTransferToast]
   );
 
   // Notifications & Real-Time WebSocket
@@ -247,24 +252,31 @@ export default function App() {
   const autoRetryCountRef = useRef(0);
   const resolvedByServerRef = useRef(false);
 
-  const extractTelegramAuth = useCallback(() => {
-    return readTelegramClientAuthSafe();
+  const extractTelegramAuth = useCallback((debug = false) => {
+    return readTelegramClientAuthSafe({ debug });
   }, []);
 
-  const enterGuestMode = useCallback(() => {
-    const guestPlayer = buildGuestPlayerFromLocal();
-    resolvedByServerRef.current = true;
-    autoRetryCountRef.current = 0;
-    setActivePlayerId(null);
-    setActiveSessionToken(null);
-    setNoOwnerFallback(true);
-    setGuestMode(true);
-    setOwnerPlayer(null);
-    setCurrentUser(guestPlayer);
-    setAllPlayers([guestPlayer]);
-    setBootState('ready');
-    loadFeedAndStories().catch(() => {});
-  }, [loadFeedAndStories]);
+  const enterGuestMode = useCallback(
+    (insideTelegram = false) => {
+      const guestPlayer = buildGuestPlayerFromLocal();
+      resolvedByServerRef.current = true;
+      autoRetryCountRef.current = 0;
+      if (insideTelegram) {
+        isTelegramMiniAppRef.current = true;
+      }
+      setIsTelegramMiniApp(insideTelegram || isTelegramMiniAppRef.current);
+      setActivePlayerId(null);
+      setActiveSessionToken(null);
+      setNoOwnerFallback(true);
+      setGuestMode(true);
+      setOwnerPlayer(null);
+      setCurrentUser(guestPlayer);
+      setAllPlayers([guestPlayer]);
+      setBootState('ready');
+      loadFeedAndStories().catch(() => {});
+    },
+    [loadFeedAndStories]
+  );
 
   const bootstrap = useCallback(
     async (backgroundRefresh = false) => {
@@ -278,11 +290,29 @@ export default function App() {
         setSlowLoading(false);
       }
       try {
-        let auth = extractTelegramAuth();
-        if (auth.isTelegramEnv && !auth.tgUser?.id && !auth.initData) {
-          for (let attempt = 0; attempt < 18; attempt += 1) {
-            await new Promise((r) => setTimeout(r, 100));
-            auth = extractTelegramAuth();
+        initTelegramWebAppSafe();
+        // Wait 500ms after ready() & expand() because Telegram WebApp user data often arrives slightly delayed
+        if (!backgroundRefresh) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+
+        let auth = extractTelegramAuth(true);
+        let inTelegram = Boolean(auth.isTelegramEnv || isTelegramMiniAppRef.current);
+        if (inTelegram) {
+          isTelegramMiniAppRef.current = true;
+          setIsTelegramMiniApp(true);
+        }
+
+        if (!auth.tgUser?.id && !auth.initData && !backgroundRefresh) {
+          // Retry at +500ms (total ~1s), then +1000ms (total ~2s)
+          for (const waitMs of [500, 1000]) {
+            await new Promise((r) => setTimeout(r, waitMs));
+            auth = extractTelegramAuth(true);
+            if (auth.isTelegramEnv) {
+              inTelegram = true;
+              isTelegramMiniAppRef.current = true;
+              setIsTelegramMiniApp(true);
+            }
             if (auth.tgUser?.id || auth.initData) break;
           }
         }
@@ -293,7 +323,7 @@ export default function App() {
         const isFramed = typeof window !== 'undefined' && window.self !== window.top;
         const ref = typeof document !== 'undefined' ? document.referrer || '' : '';
         const isStudioFrame = isFramed && (!ref || /aistudio\.google|googleusercontent\.com|localhost/i.test(ref));
-        const allowOwnerPreview = !auth.isTelegramEnv && (isLocalHost || isStudioFrame);
+        const allowOwnerPreview = !inTelegram && (isLocalHost || isStudioFrame);
         setNoOwnerFallback(!allowOwnerPreview);
 
         const { initData, tgUser } = auth;
@@ -305,6 +335,8 @@ export default function App() {
         };
 
         if (tgUser?.id || initData) {
+          isTelegramMiniAppRef.current = true;
+          setIsTelegramMiniApp(true);
           const payload = {
             initData,
             ...(tgUser?.id
@@ -335,7 +367,7 @@ export default function App() {
         } else if (allowOwnerPreview) {
           meRes = await api.getMe();
         } else {
-          enterGuestMode();
+          enterGuestMode(inTelegram);
           return;
         }
 
@@ -387,6 +419,8 @@ export default function App() {
           Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
         }
       } catch (err: any) {
+        const latestAuth = extractTelegramAuth(false);
+        const insideTg = Boolean(latestAuth.isTelegramEnv || isTelegramMiniAppRef.current);
         if (err?.code === 'SUPABASE_NOT_CONFIGURED') {
           resolvedByServerRef.current = true;
           setMissingEnv(['SUPABASE_URL', 'SUPABASE_ANON_KEY']);
@@ -400,7 +434,7 @@ export default function App() {
               setBootState('unconfigured');
               return;
             }
-            enterGuestMode();
+            enterGuestMode(insideTg);
             return;
           } catch (healthErr: any) {
             if (healthErr?.isSpaFallbackHtml) {
@@ -408,13 +442,13 @@ export default function App() {
               setBootState('static_host');
               return;
             }
-            enterGuestMode();
+            enterGuestMode(insideTg);
             return;
           }
         } else if (err?.code === 'TELEGRAM_AUTH_REQUIRED' || err?.status === 401) {
-          enterGuestMode();
+          enterGuestMode(insideTg);
         } else if (!backgroundRefresh) {
-          enterGuestMode();
+          enterGuestMode(insideTg);
         }
       }
     },
@@ -461,6 +495,26 @@ export default function App() {
   useEffect(() => {
     bootstrap(false);
   }, [bootstrap]);
+
+  // If still Guest after 2s, keep watching briefly in case Telegram WebApp injects user late
+  useEffect(() => {
+    if (!currentUser?.is_guest) return;
+    let checks = 0;
+    const timer = setInterval(() => {
+      checks += 1;
+      const lateAuth = extractTelegramAuth(false);
+      if (lateAuth.isTelegramEnv && !isTelegramMiniApp) {
+        setIsTelegramMiniApp(true);
+      }
+      if (lateAuth.tgUser?.id || lateAuth.initData) {
+        clearInterval(timer);
+        bootstrap(true);
+      } else if (checks >= 16) {
+        clearInterval(timer);
+      }
+    }, 600);
+    return () => clearInterval(timer);
+  }, [bootstrap, currentUser?.is_guest, extractTelegramAuth, isTelegramMiniApp]);
 
   // Show manual retry button if network takes unusually long (never fabricate a fake Owner account)
   useEffect(() => {
@@ -737,12 +791,21 @@ export default function App() {
   };
 
   const requireTelegramToast = useCallback(() => {
+    if (isTelegramMiniApp) {
+      if (currentUser?.is_guest) {
+        const check = extractTelegramAuth(true);
+        if (check.tgUser?.id || check.initData) {
+          bootstrap(true);
+        }
+      }
+      return;
+    }
     showTransferToast({
       id: `tg-only-${Date.now()}`,
       kind: 'sent',
       text: 'Buka NONGKRONG ZONE lewat Bot Telegram untuk fitur ini.',
     });
-  }, [showTransferToast]);
+  }, [bootstrap, currentUser?.is_guest, extractTelegramAuth, isTelegramMiniApp, showTransferToast]);
 
   const handleToggleLike = async (post: Post) => {
     if (currentUser?.is_guest) {
@@ -1221,6 +1284,34 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {/* Chrome-only Notice Banner (ALWAYS hidden inside Telegram Mini App) */}
+              {!isTelegramMiniApp && currentUser.is_guest && !chromeBannerDismissed && (
+                <div
+                  className="mx-3 mt-1.5 mb-1 px-3.5 py-2.5 rounded-xl border flex items-center justify-between gap-2.5"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-accent)',
+                    color: 'var(--nz-text)',
+                  }}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Send className="w-4 h-4 shrink-0" style={{ color: 'var(--nz-accent-text)' }} strokeWidth={2} />
+                    <p className="text-[12px] font-medium leading-snug">
+                      Buka NONGKRONG ZONE lewat Bot Telegram untuk fitur ini.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setChromeBannerDismissed(true)}
+                    className="p-1 shrink-0 hover:opacity-80"
+                    style={{ color: 'var(--nz-text-muted)' }}
+                    aria-label="Tutup banner"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
 
               {/* Compact Owner Broadcasts & WIB Bagi-Bagi Coin */}
               <HomeOwnerBanners

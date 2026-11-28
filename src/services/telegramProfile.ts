@@ -28,8 +28,11 @@ export interface TelegramClientAuth {
   initData: string;
   tgUser: ClientTelegramUser | undefined;
   hasTgWebApp: boolean;
+  platform: string;
   isTelegramEnv: boolean;
 }
+
+let detectedTelegramSessionCache = false;
 
 export function initTelegramWebAppSafe(): void {
   try {
@@ -44,20 +47,31 @@ export function initTelegramWebAppSafe(): void {
   }
 }
 
-export function readTelegramClientAuthSafe(): TelegramClientAuth {
+export function logTelegramDebugSafe(): void {
+  try {
+    const win = typeof window !== 'undefined' ? (window as any) : null;
+    const tgWebApp = win?.Telegram?.WebApp;
+    console.log('TG platform:', tgWebApp?.platform);
+    console.log('TG user:', tgWebApp?.initDataUnsafe?.user);
+  } catch {
+    // Ignore debug log errors
+  }
+}
+
+export function readTelegramClientAuthSafe(options?: { debug?: boolean }): TelegramClientAuth {
   initTelegramWebAppSafe();
 
   let initData = '';
   let tgUser: any = undefined;
   let hasTgWebApp = false;
-  let platform = '';
+  let platform = 'unknown';
   let hasProxy = false;
 
   try {
     const win = typeof window !== 'undefined' ? (window as any) : null;
     const tgWebApp = win?.Telegram?.WebApp;
-    hasTgWebApp = Boolean(tgWebApp);
-    platform = String(tgWebApp?.platform || '').toLowerCase();
+    hasTgWebApp = Boolean(win?.Telegram && tgWebApp);
+    platform = String(tgWebApp?.platform || 'unknown').toLowerCase() || 'unknown';
     hasProxy = Boolean(win?.TelegramWebviewProxy);
 
     if (typeof tgWebApp?.initData === 'string') {
@@ -65,6 +79,11 @@ export function readTelegramClientAuthSafe(): TelegramClientAuth {
     }
     if (tgWebApp?.initDataUnsafe?.user && tgWebApp.initDataUnsafe.user.id) {
       tgUser = tgWebApp.initDataUnsafe.user;
+    }
+
+    if (options?.debug) {
+      console.log('TG platform:', tgWebApp?.platform);
+      console.log('TG user:', tgWebApp?.initDataUnsafe?.user);
     }
   } catch {
     // Ignore errors reading window.Telegram.WebApp
@@ -121,12 +140,16 @@ export function readTelegramClientAuthSafe(): TelegramClientAuth {
   }
 
   let hasUrlData = false;
+  let hasSessionTgParams = false;
   let isTgUa = false;
   try {
     if (typeof window !== 'undefined') {
+      const fullUrl = `${window.location.search}${window.location.hash}`;
       hasUrlData =
-        window.location.hash.includes('tgWebAppData') ||
-        window.location.search.includes('tgWebAppData');
+        fullUrl.includes('tgWebAppData') ||
+        fullUrl.includes('tgWebAppVersion') ||
+        fullUrl.includes('tgWebAppPlatform');
+      hasSessionTgParams = Boolean(window.sessionStorage.getItem('__telegram__initParams'));
     }
     if (typeof navigator !== 'undefined') {
       isTgUa = /Telegram/i.test(navigator.userAgent);
@@ -146,16 +169,23 @@ export function readTelegramClientAuthSafe(): TelegramClientAuth {
         }
       : undefined;
 
+  const isPlatformTelegram = Boolean(hasTgWebApp && platform && platform !== 'unknown');
   const isTelegramEnv = Boolean(
-    initData ||
-      normalizedUser?.id ||
-      (platform && platform !== 'unknown') ||
+    detectedTelegramSessionCache ||
+      isPlatformTelegram ||
+      hasUrlData ||
+      hasSessionTgParams ||
       hasProxy ||
       isTgUa ||
-      hasUrlData
+      initData ||
+      normalizedUser?.id
   );
 
-  return { initData, tgUser: normalizedUser, hasTgWebApp, isTelegramEnv };
+  if (isTelegramEnv) {
+    detectedTelegramSessionCache = true;
+  }
+
+  return { initData, tgUser: normalizedUser, hasTgWebApp, platform, isTelegramEnv };
 }
 
 export function loadLocalNongkrongProfile(): NongkrongLocalProfile | null {
@@ -210,8 +240,9 @@ export function getTelegramDisplayName(tgUser?: ClientTelegramUser | null): stri
 /**
  * Syncs client-side Telegram profile with `localStorage.nongkrong_profile`
  * following the exact rules:
- * - First open: fills Name (first_name + last_name), Photo (photo_url), Username from Telegram & stores in `nongkrong_profile`.
- * - Subsequent opens: preserves user-edited Name / Photo (does NOT overwrite with Telegram data),
+ * - Never overwrites Telegram profile with Guest localStorage profile.
+ * - First open (or if user hasn't edited Name/Photo): uses Telegram Name (first_name + last_name) & Photo (photo_url).
+ * - Subsequent opens: preserves user-edited Name / Photo,
  *   while ALWAYS updating Username to the latest Telegram username (when Telegram provides one).
  */
 export function syncTelegramUserWithLocalProfile(
@@ -249,32 +280,43 @@ export function syncTelegramUserWithLocalProfile(
 
   const customNameEdited = Boolean(
     (isSameStoredUser && stored?.custom_name_edited) ||
-      (serverName && tgName && serverName !== tgName && !/^tg_\d+$/.test(serverName) && serverName !== 'Pengguna')
+      (serverName &&
+        tgName &&
+        serverName !== tgName &&
+        !/^tg_\d+$/.test(serverName) &&
+        serverName !== 'Pengguna' &&
+        serverName !== 'Guest')
   );
   const customAvatarEdited = Boolean(
     (isSameStoredUser && stored?.custom_avatar_edited) ||
-      (serverAvatar && tgPhotoUrl && serverAvatar !== tgPhotoUrl && !serverAvatar.includes(`tg_avatar_${tgId}`))
+      (serverAvatar &&
+        tgPhotoUrl &&
+        serverAvatar !== tgPhotoUrl &&
+        !serverAvatar.includes(`tg_avatar_${tgId}`))
   );
 
-  const resolvedName = isSameStoredUser && stored?.custom_name_edited && stored.name.trim()
-    ? stored.name.trim().slice(0, 20)
-    : serverName || tgName;
+  const resolvedName =
+    isSameStoredUser && stored?.custom_name_edited && stored.name.trim()
+      ? stored.name.trim().slice(0, 20)
+      : customNameEdited && serverName
+        ? serverName
+        : tgName || serverName;
 
   const resolvedAvatarUrl =
     isSameStoredUser && stored?.custom_avatar_edited
       ? stored.avatar_url
-      : serverAvatar ?? tgPhotoUrl;
+      : customAvatarEdited && serverAvatar
+        ? serverAvatar
+        : tgPhotoUrl ?? serverAvatar;
 
   const resolvedUsername = hasTelegramUsername
     ? rawTgUsername
-    : (serverPlayer?.username || (isSameStoredUser ? stored?.username : '') || `tg_${tgId}`);
+    : serverPlayer?.username || (isSameStoredUser ? stored?.username : '') || `tg_${tgId}`;
 
   const needsServerSync = Boolean(
     serverPlayer &&
-      ((isSameStoredUser &&
-        stored?.custom_name_edited &&
-        stored.name.trim() &&
-        stored.name.trim() !== serverPlayer.name) ||
+      ((resolvedName && resolvedName !== serverPlayer.name) ||
+        (resolvedAvatarUrl && resolvedAvatarUrl !== (serverPlayer.avatar_url || null)) ||
         (isSameStoredUser &&
           stored?.custom_avatar_edited &&
           stored.avatar_url !== (serverPlayer.avatar_url || null)))

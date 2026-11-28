@@ -2503,7 +2503,12 @@ export async function createApp(): Promise<express.Express> {
         updates.bio = profileRow.bio;
       }
       const existingNameTrimmed = String(existing.name || '').trim();
-      if (!existingNameTrimmed || existingNameTrimmed === 'Pengguna' || /^tg_\d+$/.test(existingNameTrimmed)) {
+      if (
+        !existingNameTrimmed ||
+        existingNameTrimmed === 'Pengguna' ||
+        existingNameTrimmed === 'Guest' ||
+        /^tg_\d+$/.test(existingNameTrimmed)
+      ) {
         const fallbackProfName =
           typeof profileRow?.full_name === 'string' && profileRow.full_name.trim()
             ? profileRow.full_name.trim().slice(0, 20)
