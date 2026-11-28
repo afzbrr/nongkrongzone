@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ArrowUpDown,
   Ban,
   ChevronDown,
   ChevronUp,
@@ -11,11 +12,14 @@ import {
   Megaphone,
   Plus,
   Power,
+  RefreshCw,
+  Search,
+  Send,
   Trash2,
   Users,
   X,
 } from 'lucide-react';
-import type { Giveaway, OwnerBroadcast, OwnerPanelStats } from '../types';
+import type { Giveaway, OwnerBroadcast, OwnerPanelStats, Player } from '../types';
 import { api } from '../services/api';
 import { formatNumber } from '../utils/format';
 import {
@@ -25,6 +29,7 @@ import {
   parseWibDateTimeToIso,
 } from '../utils/wib';
 import { Avatar } from './Avatar';
+import { CoinDisplay, OwnerBadge } from './PlayerBadges';
 
 interface OwnerPanelModalProps {
   broadcasts: OwnerBroadcast[];
@@ -32,6 +37,8 @@ interface OwnerPanelModalProps {
   stats?: OwnerPanelStats | null;
   onClose: () => void;
   onStateChanged: () => Promise<void> | void;
+  onViewProfile?: (username: string) => void;
+  onTransferToUser?: (player: Player) => void;
 }
 
 export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
@@ -40,9 +47,19 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
   stats,
   onClose,
   onStateChanged,
+  onViewProfile,
+  onTransferToUser,
 }) => {
-  const [tab, setTab] = useState<'broadcast' | 'giveaway'>('broadcast');
+  const [tab, setTab] = useState<'broadcast' | 'giveaway' | 'users'>('broadcast');
   const [nowMs, setNowMs] = useState(() => Date.now());
+
+  // Owner users coin list state
+  const [usersList, setUsersList] = useState<Player[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState<string | null>(null);
+  const [userSearch, setUserSearch] = useState('');
+  const [userSort, setUserSort] = useState<'highest' | 'lowest' | 'newest'>('highest');
+  const [usersLoadedOnce, setUsersLoadedOnce] = useState(false);
 
   // Broadcast form state
   const initialWib = useMemo(() => getWibParts(Date.now()), []);
@@ -71,6 +88,50 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
     const timer = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  const loadUsersCoins = async () => {
+    setUsersLoading(true);
+    setUsersError(null);
+    try {
+      const res = await api.getOwnerUsersCoins();
+      setUsersList(res.users || []);
+      setUsersLoadedOnce(true);
+    } catch (err: any) {
+      setUsersError(err?.message || 'Gagal memuat daftar coin pengguna');
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab === 'users') {
+      loadUsersCoins();
+    }
+  }, [tab, stats?.totalCoinsCirculating, stats?.totalUsers]);
+
+  const filteredAndSortedUsers = useMemo(() => {
+    const q = userSearch.trim().replace(/^@/, '').toLowerCase();
+    const list = usersList.filter((u) => {
+      if (!q) return true;
+      return (
+        String(u.name || '').toLowerCase().includes(q) ||
+        String(u.full_name || '').toLowerCase().includes(q) ||
+        String(u.username || '').toLowerCase().includes(q)
+      );
+    });
+    return [...list].sort((a, b) => {
+      const aOwner = a.is_owner || a.role === 'owner' || a.telegram_id === 6189849073 ? 1 : 0;
+      const bOwner = b.is_owner || b.role === 'owner' || b.telegram_id === 6189849073 ? 1 : 0;
+      if (aOwner !== bOwner) return bOwner - aOwner;
+      if (userSort === 'lowest') {
+        return Number(a.coins || 0) - Number(b.coins || 0);
+      }
+      if (userSort === 'newest') {
+        return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+      }
+      return Number(b.coins || 0) - Number(a.coins || 0);
+    });
+  }, [usersList, userSearch, userSort]);
 
   const wibNow = useMemo(() => getWibParts(nowMs), [nowMs]);
 
@@ -310,8 +371,10 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
           className="px-3.5 py-2.5 border-b grid grid-cols-3 gap-2 shrink-0"
           style={{ borderColor: 'var(--nz-border)', background: 'var(--nz-card)' }}
         >
-          <div
-            className="px-2.5 py-1.5 rounded-lg border"
+          <button
+            type="button"
+            onClick={() => setTab('users')}
+            className="px-2.5 py-1.5 rounded-lg border text-left hover:opacity-90 transition-opacity"
             style={{ background: 'var(--nz-elevated)', borderColor: 'var(--nz-border)' }}
           >
             <span className="text-[10px] block" style={{ color: 'var(--nz-text-muted)' }}>
@@ -320,9 +383,11 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
             <span className="font-display text-[13.5px] font-bold tabular-nums">
               {formatNumber(stats?.totalUsers ?? 0)}
             </span>
-          </div>
-          <div
-            className="px-2.5 py-1.5 rounded-lg border"
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('users')}
+            className="px-2.5 py-1.5 rounded-lg border text-left hover:opacity-90 transition-opacity"
             style={{ background: 'var(--nz-elevated)', borderColor: 'var(--nz-border)' }}
           >
             <span className="text-[10px] block" style={{ color: 'var(--nz-text-muted)' }}>
@@ -331,7 +396,7 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
             <span className="font-display text-[13.5px] font-bold tabular-nums text-[#FACC15]">
               {formatNumber(stats?.totalCoinsCirculating ?? 0)}
             </span>
-          </div>
+          </button>
           <div
             className="px-2.5 py-1.5 rounded-lg border"
             style={{ background: 'var(--nz-elevated)', borderColor: 'var(--nz-border)' }}
@@ -349,20 +414,20 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
         </div>
 
         {/* Sub-Tabs */}
-        <div className="grid grid-cols-2 border-b shrink-0" style={{ borderColor: 'var(--nz-border)' }}>
+        <div className="grid grid-cols-3 border-b shrink-0" style={{ borderColor: 'var(--nz-border)' }}>
           <button
             type="button"
             onClick={() => setTab('broadcast')}
-            className="h-11 flex items-center justify-center gap-1.5 text-[12.5px] font-semibold relative transition-colors"
+            className="h-11 flex items-center justify-center gap-1.5 text-[12px] font-semibold relative transition-colors"
             style={{
               color: tab === 'broadcast' ? 'var(--nz-text)' : 'var(--nz-text-muted)',
             }}
           >
-            <Megaphone className="w-4 h-4" strokeWidth={1.8} />
+            <Megaphone className="w-3.5 h-3.5" strokeWidth={1.8} />
             <span>Broadcast</span>
             {tab === 'broadcast' && (
               <span
-                className="absolute bottom-0 left-4 right-4 h-[2px] rounded-full"
+                className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full"
                 style={{ background: 'var(--nz-btn-bg)' }}
               />
             )}
@@ -371,16 +436,34 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
           <button
             type="button"
             onClick={() => setTab('giveaway')}
-            className="h-11 flex items-center justify-center gap-1.5 text-[12.5px] font-semibold relative transition-colors"
+            className="h-11 flex items-center justify-center gap-1.5 text-[12px] font-semibold relative transition-colors"
             style={{
               color: tab === 'giveaway' ? 'var(--nz-text)' : 'var(--nz-text-muted)',
             }}
           >
-            <Gift className="w-4 h-4" strokeWidth={1.8} />
-            <span>Bagi-Bagi Coin</span>
+            <Gift className="w-3.5 h-3.5" strokeWidth={1.8} />
+            <span>Bagi Coin</span>
             {tab === 'giveaway' && (
               <span
-                className="absolute bottom-0 left-4 right-4 h-[2px] rounded-full"
+                className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full"
+                style={{ background: 'var(--nz-btn-bg)' }}
+              />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setTab('users')}
+            className="h-11 flex items-center justify-center gap-1.5 text-[12px] font-semibold relative transition-colors"
+            style={{
+              color: tab === 'users' ? 'var(--nz-text)' : 'var(--nz-text-muted)',
+            }}
+          >
+            <Coins className="w-3.5 h-3.5" strokeWidth={1.8} />
+            <span>Coin User</span>
+            {tab === 'users' && (
+              <span
+                className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full"
                 style={{ background: 'var(--nz-btn-bg)' }}
               />
             )}
@@ -647,7 +730,7 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
                 )}
               </div>
             </>
-          ) : (
+          ) : tab === 'giveaway' ? (
             <>
               <form
                 onSubmit={handleCreateGiveaway}
@@ -968,6 +1051,205 @@ export const OwnerPanelModal: React.FC<OwnerPanelModalProps> = ({
                 )}
               </div>
             </>
+          ) : (
+            /* Coin Semua User (Owner Only) */
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-2">
+                <div
+                  className="flex-1 flex items-center gap-2 px-3 h-9 rounded-xl border min-w-0"
+                  style={{ background: 'var(--nz-card)', borderColor: 'var(--nz-border)' }}
+                >
+                  <Search className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--nz-text-muted)' }} />
+                  <input
+                    type="text"
+                    value={userSearch}
+                    onChange={(e) => setUserSearch(e.target.value)}
+                    placeholder="Cari nama atau @username..."
+                    className="flex-1 bg-transparent text-[12.5px] focus:outline-none min-w-0"
+                    style={{ color: 'var(--nz-text)' }}
+                  />
+                  {userSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setUserSearch('')}
+                      className="p-0.5 hover:opacity-80"
+                      style={{ color: 'var(--nz-text-muted)' }}
+                      aria-label="Hapus pencarian"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setUserSort((prev) =>
+                      prev === 'highest' ? 'lowest' : prev === 'lowest' ? 'newest' : 'highest'
+                    )
+                  }
+                  className="h-9 px-2.5 rounded-xl border text-[11.5px] font-semibold flex items-center gap-1 shrink-0 hover:opacity-90"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-border)',
+                    color: 'var(--nz-text)',
+                  }}
+                >
+                  <ArrowUpDown className="w-3.5 h-3.5" />
+                  <span>
+                    {userSort === 'highest'
+                      ? 'Terbanyak'
+                      : userSort === 'lowest'
+                        ? 'Tersedikit'
+                        : 'Terbaru'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={loadUsersCoins}
+                  disabled={usersLoading}
+                  className="h-9 w-9 rounded-xl border flex items-center justify-center shrink-0 hover:opacity-90 disabled:opacity-50"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-border)',
+                    color: 'var(--nz-text-muted)',
+                  }}
+                  aria-label="Muat ulang daftar coin"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${usersLoading ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between text-[11.5px] px-0.5" style={{ color: 'var(--nz-text-muted)' }}>
+                <span>
+                  Menampilkan <strong style={{ color: 'var(--nz-text)' }}>{filteredAndSortedUsers.length}</strong> pengguna
+                </span>
+                <span>
+                  Total beredar:{' '}
+                  <strong className="text-[#FACC15] tabular-nums">
+                    {formatNumber(
+                      usersList.reduce((sum, u) => {
+                        const isOwnerUser = u.is_owner || u.role === 'owner' || u.telegram_id === 6189849073;
+                        if (isOwnerUser || u.is_banned) return sum;
+                        return sum + Number(u.coins || 0);
+                      }, 0)
+                    )}{' '}
+                    Coin
+                  </strong>
+                </span>
+              </div>
+
+              {usersError && (
+                <div
+                  className="p-3 rounded-xl border border-[#FF453A]/35 text-[12px] text-[#FF453A] flex items-center justify-between gap-2"
+                  style={{ background: 'var(--nz-card)' }}
+                >
+                  <span>{usersError}</span>
+                  <button
+                    type="button"
+                    onClick={loadUsersCoins}
+                    className="font-bold underline shrink-0"
+                  >
+                    Coba Lagi
+                  </button>
+                </div>
+              )}
+
+              {usersLoading && !usersLoadedOnce ? (
+                <div className="flex flex-col gap-2">
+                  {[1, 2, 3].map((idx) => (
+                    <div
+                      key={idx}
+                      className="h-14 rounded-xl border animate-pulse"
+                      style={{ background: 'var(--nz-card)', borderColor: 'var(--nz-border)' }}
+                    />
+                  ))}
+                </div>
+              ) : filteredAndSortedUsers.length === 0 ? (
+                <div
+                  className="py-8 text-center rounded-xl border text-[12.5px]"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-border)',
+                    color: 'var(--nz-text-muted)',
+                  }}
+                >
+                  {userSearch ? 'Pengguna tidak ditemukan' : 'Belum ada pengguna'}
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {filteredAndSortedUsers.map((u) => {
+                    const isOwnerUser = Boolean(
+                      u.is_owner || u.role === 'owner' || u.telegram_id === 6189849073
+                    );
+                    return (
+                      <div
+                        key={u.id}
+                        className="p-2.5 rounded-xl border flex items-center justify-between gap-2.5"
+                        style={{ background: 'var(--nz-card)', borderColor: 'var(--nz-border)' }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onViewProfile?.(u.username)}
+                          className="flex items-center gap-2.5 min-w-0 flex-1 text-left hover:opacity-90"
+                        >
+                          <Avatar player={u} size={36} />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className="font-display text-[13px] font-bold truncate">
+                                {u.full_name || u.name}
+                              </span>
+                              {isOwnerUser && <OwnerBadge compact />}
+                              {u.is_banned && (
+                                <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#FF453A]/15 text-[#FF453A] uppercase shrink-0">
+                                  Banned
+                                </span>
+                              )}
+                            </div>
+                            <span
+                              className="text-[11.5px] block truncate"
+                              style={{ color: 'var(--nz-text-muted)' }}
+                            >
+                              @{u.username}
+                            </span>
+                          </div>
+                        </button>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <div
+                            className="px-2.5 py-1 rounded-lg border text-[12px]"
+                            style={{
+                              background: 'var(--nz-elevated)',
+                              borderColor: 'var(--nz-border)',
+                            }}
+                          >
+                            <CoinDisplay coins={u.coins} isOwner={isOwnerUser} iconSize="sm" />
+                          </div>
+
+                          {!isOwnerUser && onTransferToUser && (
+                            <button
+                              type="button"
+                              onClick={() => onTransferToUser(u)}
+                              className="h-7 w-7 rounded-lg border flex items-center justify-center hover:opacity-90"
+                              style={{
+                                background: 'var(--nz-elevated)',
+                                borderColor: 'var(--nz-border)',
+                                color: 'var(--nz-accent-text)',
+                              }}
+                              title={`Transfer coin ke @${u.username}`}
+                              aria-label={`Transfer coin ke @${u.username}`}
+                            >
+                              <Send className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>

@@ -43,8 +43,7 @@ export const TransferCoinModal: React.FC<TransferCoinModalProps> = ({
   const isSenderOwner = Boolean(
     currentUser.is_owner ||
       currentUser.role === 'owner' ||
-      currentUser.telegram_id === 6189849073 ||
-      String(currentUser.username || '').toLowerCase() === 'afz'
+      currentUser.telegram_id === 6189849073
   );
 
   const cleanQuery = query.trim().replace(/^@/, '');
@@ -236,7 +235,7 @@ export const TransferCoinModal: React.FC<TransferCoinModalProps> = ({
                       setQuery(e.target.value);
                       setErrorMsg(null);
                     }}
-                    placeholder="Ketik username, misal: afz"
+                    placeholder="Ketik username tujuan..."
                     className="flex-1 bg-transparent text-[13.5px] focus:outline-none min-w-0"
                     style={{ color: 'var(--nz-text)' }}
                   />

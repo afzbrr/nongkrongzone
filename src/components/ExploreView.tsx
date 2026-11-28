@@ -11,6 +11,7 @@ interface ExploreViewProps {
   onOpenProfile: (username: string) => void;
   onOpenComments: (post: Post) => void;
   onRequireTelegram?: () => void;
+  onReposted?: (repost: Post) => void;
 }
 
 export const ExploreView: React.FC<ExploreViewProps> = ({
@@ -18,6 +19,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   onOpenProfile,
   onOpenComments,
   onRequireTelegram,
+  onReposted,
 }) => {
   const [query, setQuery] = useState('');
   const [peopleTab, setPeopleTab] = useState<'members' | 'leaderboard'>('members');
@@ -39,7 +41,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         api.getPosts(q ? { q } : undefined),
       ]);
       setPlayers(pRes.players);
-      setPosts(postRes.posts);
+      setPosts((postRes.posts || []).filter((p) => !p.original_post_id));
     } finally {
       setLoading(false);
     }
@@ -278,12 +280,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   onRequireTelegram?.();
                   return;
                 }
-                await api.createPost({
+                const res = await api.createPost({
                   original_post_id: orig.id,
                   repost_caption: cap || undefined,
                   media_type: 'text',
                 });
-                loadExplore(query.trim());
+                onReposted?.(res.post);
               }}
               onDeletePost={async (id) => {
                 if (currentUser.is_guest) {

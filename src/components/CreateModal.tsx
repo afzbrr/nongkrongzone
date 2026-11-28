@@ -10,7 +10,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import type { Player } from '../types';
+import type { Player, Post } from '../types';
 import { api, uploadMediaFile } from '../services/api';
 import { THEMES } from '../context/ThemeContext';
 import { Avatar } from './Avatar';
@@ -21,7 +21,7 @@ interface CreateModalProps {
   currentUser: Player;
   allPlayers: Player[];
   onClose: () => void;
-  onCreatedPost: () => void;
+  onCreatedPost: (createdPost?: Post) => void;
   onCreatedStory: () => void;
 }
 
@@ -276,13 +276,14 @@ export const CreateModal: React.FC<CreateModalProps> = ({
 
     try {
       if (mode === 'post') {
+        let createdRes: { post: Post };
         if (postKind === 'text') {
           if (!caption.trim()) {
             setError('Tulis isi postingan terlebih dahulu');
             setSubmitting(false);
             return;
           }
-          await api.createPost({
+          createdRes = await api.createPost({
             caption: caption.trim(),
             media_urls: [],
             media_type: 'text',
@@ -293,13 +294,13 @@ export const CreateModal: React.FC<CreateModalProps> = ({
             setSubmitting(false);
             return;
           }
-          await api.createPost({
+          createdRes = await api.createPost({
             caption: caption.trim(),
             media_urls: [postMediaUrl.trim()],
             media_type: postKind,
           });
         }
-        onCreatedPost();
+        onCreatedPost(createdRes.post);
         onClose();
       } else {
         if (storyKind === 'text') {

@@ -479,6 +479,13 @@ export const api = {
       serverNow: string;
     }>('/api/owner/panel-state', { cache: 'no-store' }),
 
+  getOwnerUsersCoins: (q = '') =>
+    apiFetch<{
+      users: Player[];
+      totalUsers: number;
+      totalCoinsCirculating: number;
+    }>(`/api/owner/users-coins${q ? `?q=${encodeURIComponent(q)}` : ''}`, { cache: 'no-store' }),
+
   createOwnerBroadcast: (payload: {
     title?: string;
     message: string;

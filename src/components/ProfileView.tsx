@@ -29,9 +29,28 @@ import { Avatar } from './Avatar';
 import { CoinDisplay, OwnerBadge } from './PlayerBadges';
 import { PostCard } from './PostCard';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const profileCache = new Map<string, Player>();
+const profilePostsCache = new Map<string, Post[]>();
+
+function mergePostsUnique(primary: Post[], secondary: Post[]): Post[] {
+  const byId = new Map<string, Post>();
+  for (const p of secondary) {
+    if (p?.id) byId.set(p.id, p);
+  }
+  for (const p of primary) {
+    if (p?.id) byId.set(p.id, p);
+  }
+  return Array.from(byId.values()).sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
+}
+
 interface ProfileViewProps {
   username: string;
   currentUser: Player;
+  initialPosts?: Post[];
+  knownPlayers?: Player[];
   onBack?: () => void;
   onOpenProfile: (username: string) => void;
   onOpenChatWith: (peer: Player) => void;
@@ -42,12 +61,16 @@ interface ProfileViewProps {
   onOpenTransferCoin?: (initialRecipient?: Player | null) => void;
   onOpenOwnerPanel?: () => void;
   onRequireTelegram?: () => void;
+  onPostCreatedOrReposted?: (post: Post) => void;
+  onPostDeleted?: (postId: string) => void;
   syncVersion?: number;
 }
 
 export const ProfileView: React.FC<ProfileViewProps> = ({
   username,
   currentUser,
+  initialPosts = [],
+  knownPlayers = [],
   onBack,
   onOpenProfile,
   onOpenChatWith,
@@ -58,13 +81,43 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onOpenTransferCoin,
   onOpenOwnerPanel,
   onRequireTelegram,
+  onPostCreatedOrReposted,
+  onPostDeleted,
   syncVersion,
 }) => {
   const { bordersById } = useBorders();
   const { theme, setThemeId } = useTheme();
-  const [profile, setProfile] = useState<Player | null>(null);
-  const [posts, setPosts] = useState<Post[]>([]);
-  const [loading, setLoading] = useState(true);
+  const cacheKey = username.toLowerCase();
+
+  const findSeedPosts = (targetUsername: string, targetId?: string | null) => {
+    const key = targetUsername.toLowerCase();
+    const cached = profilePostsCache.get(key) || [];
+    const matchedFromFeed = initialPosts.filter(
+      (p) =>
+        (targetId && p.player_id === targetId) ||
+        p.player?.username?.toLowerCase() === key
+    );
+    return mergePostsUnique(matchedFromFeed, cached);
+  };
+
+  const matchedKnownPlayer =
+    username.toLowerCase() === currentUser.username.toLowerCase()
+      ? currentUser
+      : knownPlayers.find((p) => p.username.toLowerCase() === cacheKey) ||
+        profileCache.get(cacheKey) ||
+        null;
+
+  const [profile, setProfile] = useState<Player | null>(() =>
+    profileCache.get(cacheKey) || matchedKnownPlayer
+  );
+  const [posts, setPosts] = useState<Post[]>(() =>
+    findSeedPosts(username, matchedKnownPlayer?.id)
+  );
+  const [loading, setLoading] = useState(() => !(profileCache.get(cacheKey) || matchedKnownPlayer));
+  const [loadingPosts, setLoadingPosts] = useState(() => {
+    const seeded = findSeedPosts(username, matchedKnownPlayer?.id);
+    return seeded.length === 0 && !(currentUser.is_guest && username.toLowerCase() === currentUser.username.toLowerCase());
+  });
 
   // Modals / Sheets
   const [unfollowConfirmOpen, setUnfollowConfirmOpen] = useState(false);
@@ -90,21 +143,47 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const dragStartYRef = useRef<number | null>(null);
 
   const loadProfileData = async (silent = false) => {
-    const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
+    const key = username.toLowerCase();
+    const isOwnByUsername = key === currentUser.username.toLowerCase();
     if (currentUser.is_guest && isOwnByUsername) {
       setProfile(currentUser);
       setPosts([]);
       setLoading(false);
+      setLoadingPosts(false);
       return;
     }
-    if (isOwnByUsername && (!profile || profile.id !== currentUser.id)) {
-      setProfile(currentUser);
+
+    const cachedProfile = profileCache.get(key) || null;
+    const knownPlayer =
+      (isOwnByUsername ? currentUser : knownPlayers.find((p) => p.username.toLowerCase() === key)) ||
+      cachedProfile;
+    const knownUuid = knownPlayer?.id && UUID_RE.test(knownPlayer.id) ? knownPlayer.id : null;
+
+    const seeded = findSeedPosts(username, knownUuid || knownPlayer?.id);
+    if (seeded.length > 0 && !silent) {
+      setPosts((prev) => mergePostsUnique(seeded, prev));
+    }
+
+    if (isOwnByUsername) {
+      setProfile((prev) => prev || cachedProfile || currentUser);
       setLoading(false);
-    } else if (!profile && !silent) {
+    } else if (knownPlayer && !silent) {
+      setProfile((prev) => prev || knownPlayer);
+      setLoading(false);
+    } else if (!profile && !cachedProfile && !silent) {
       setLoading(true);
     }
+
+    if (!silent && seeded.length === 0 && !profilePostsCache.has(key)) {
+      setLoadingPosts(true);
+    }
+
     try {
-      const pRes = await api.getPlayerProfile(username);
+      const [pRes, earlyPostsRes] = await Promise.all([
+        api.getPlayerProfile(username),
+        knownUuid ? api.getPosts({ playerId: knownUuid }) : Promise.resolve(null),
+      ]);
+
       const mergedProfile: Player = isOwnByUsername
         ? {
             ...pRes.player,
@@ -112,34 +191,70 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               pRes.player.has_telegram_username ?? currentUser.has_telegram_username,
           }
         : pRes.player;
+
+      profileCache.set(key, mergedProfile);
       setProfile(mergedProfile);
-      if (!mergedProfile.is_blocked_by_me && !mergedProfile.has_blocked_me) {
-        const postsRes = await api.getPosts({ playerId: mergedProfile.id });
-        setPosts(postsRes.posts);
-      } else {
+      setLoading(false);
+
+      if (mergedProfile.is_blocked_by_me || mergedProfile.has_blocked_me) {
+        profilePostsCache.set(key, []);
         setPosts([]);
+      } else {
+        const postsRes =
+          earlyPostsRes && knownUuid === mergedProfile.id
+            ? earlyPostsRes
+            : await api.getPosts({ playerId: mergedProfile.id });
+        const nextPosts = postsRes.posts || [];
+        profilePostsCache.set(key, nextPosts);
+        setPosts(nextPosts);
       }
     } catch {
       if (!silent) {
         if (isOwnByUsername) {
-          setProfile(currentUser);
-        } else {
+          setProfile((prev) => prev || currentUser);
+        } else if (!cachedProfile && !knownPlayer) {
           setProfile(null);
         }
-        setPosts([]);
       }
     } finally {
       setLoading(false);
+      setLoadingPosts(false);
     }
   };
 
   useEffect(() => {
+    const key = username.toLowerCase();
     setProfileContentTab('posts');
+    const known =
+      key === currentUser.username.toLowerCase()
+        ? currentUser
+        : knownPlayers.find((p) => p.username.toLowerCase() === key) || profileCache.get(key) || null;
+    setProfile(profileCache.get(key) || known);
+    const seeded = findSeedPosts(username, known?.id);
+    setPosts(seeded);
+    setLoading(!(profileCache.get(key) || known));
+    setLoadingPosts(seeded.length === 0 && !profilePostsCache.has(key));
   }, [username]);
 
   useEffect(() => {
+    const targetId = profile?.id || matchedKnownPlayer?.id;
+    const fromFeed = initialPosts.filter(
+      (p) =>
+        (targetId && p.player_id === targetId) ||
+        p.player?.username?.toLowerCase() === cacheKey
+    );
+    if (fromFeed.length > 0) {
+      setPosts((prev) => {
+        const merged = mergePostsUnique(fromFeed, prev);
+        profilePostsCache.set(cacheKey, merged);
+        return merged;
+      });
+    }
+  }, [initialPosts, cacheKey, profile?.id, matchedKnownPlayer?.id]);
+
+  useEffect(() => {
     loadProfileData(false);
-  }, [username, currentUser.id, currentUser.username, currentUser.avatar_url, currentUser.name, currentUser.border_id]);
+  }, [username, currentUser.id, currentUser.username]);
 
   useEffect(() => {
     if (!syncVersion) return;
@@ -288,17 +403,29 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       onRequireTelegram?.();
       return;
     }
-    await api.createPost({
+    const res = await api.createPost({
       original_post_id: origPost.id,
       repost_caption: repostCaption || undefined,
       media_type: 'text',
     });
-    loadProfileData();
+    if (isMe && res.post) {
+      setPosts((prev) => {
+        const next = mergePostsUnique([res.post], prev);
+        profilePostsCache.set(cacheKey, next);
+        return next;
+      });
+    }
+    onPostCreatedOrReposted?.(res.post);
   };
 
   const handleDeletePost = async (postId: string) => {
     await api.deletePost(postId);
-    setPosts((prev) => prev.filter((p) => p.id !== postId));
+    setPosts((prev) => {
+      const next = prev.filter((p) => p.id !== postId);
+      profilePostsCache.set(cacheKey, next);
+      return next;
+    });
+    onPostDeleted?.(postId);
     setProfile((prev) =>
       prev ? { ...prev, posts_count: Math.max(0, (prev.posts_count || 1) - 1) } : prev
     );
@@ -532,7 +659,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 className="font-display text-[15px] font-bold tabular-nums"
                 style={{ color: 'var(--nz-text)' }}
               >
-                {formatNumber(displayProfile.posts_count ?? posts.length)}
+                {formatNumber(
+                  !loadingPosts
+                    ? posts.filter((p) => !p.original_post_id).length
+                    : (displayProfile.posts_count ?? posts.filter((p) => !p.original_post_id).length)
+                )}
               </div>
               <div className="text-[11px]" style={{ color: 'var(--nz-text-muted)' }}>
                 Postingan
@@ -602,8 +733,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               isOwner={Boolean(
                 displayProfile.is_owner ||
                   displayProfile.role === 'owner' ||
-                  displayProfile.telegram_id === 6189849073 ||
-                  String(displayProfile.username || '').toLowerCase() === 'afz'
+                  displayProfile.telegram_id === 6189849073
               )}
             />
             {isMe && !displayProfile.is_guest && onOpenTransferCoin && (
@@ -711,8 +841,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 Boolean(
                   displayProfile.is_owner ||
                     displayProfile.role === 'owner' ||
-                    displayProfile.telegram_id === 6189849073 ||
-                    String(displayProfile.username || '').toLowerCase() === 'afz'
+                    displayProfile.telegram_id === 6189849073
                 ) && (
                   <button
                     type="button"
@@ -885,6 +1014,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         }
 
         if (displayedPosts.length === 0) {
+          if (loadingPosts) {
+            return (
+              <div className="py-16 text-center text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
+                {profileContentTab === 'reposts' ? 'Memuat repost...' : 'Memuat postingan...'}
+              </div>
+            );
+          }
           return (
             <div
               className="py-16 flex flex-col items-center justify-center gap-2 text-center text-[13px]"

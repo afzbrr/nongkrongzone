@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bell,
   Crown,
@@ -82,9 +82,12 @@ export default function App() {
 
   // Feed & Stories
   const [posts, setPosts] = useState<Post[]>([]);
+  const [repostCache, setRepostCache] = useState<Post[]>([]);
   const [loadingFeed, setLoadingFeed] = useState(false);
   const [storyGroups, setStoryGroups] = useState<StoryGroup[]>([]);
   const [storyViewerIndex, setStoryViewerIndex] = useState<number | null>(null);
+  const homePosts = useMemo(() => posts.filter((p) => !p.original_post_id), [posts]);
+  const profileSeedPosts = useMemo(() => [...posts, ...repostCache], [posts, repostCache]);
 
   // Modals / Overlays
   const [commentsPost, setCommentsPost] = useState<Post | null>(null);
@@ -167,9 +170,12 @@ export default function App() {
   }, []);
 
   const [activitySyncVersion, setActivitySyncVersion] = useState(0);
+  const feedInFlightRef = useRef(false);
 
   const loadFeedAndStories = useCallback(
     async (silent = false) => {
+      if (silent && feedInFlightRef.current) return;
+      feedInFlightRef.current = true;
       if (!silent) {
         setLoadingFeed(true);
       }
@@ -179,13 +185,14 @@ export default function App() {
           api.getStories(),
           api.getPlayers(),
         ]);
-        setPosts(postsRes.posts);
+        setPosts((postsRes.posts || []).filter((p) => !p.original_post_id));
         setStoryGroups(storiesRes.storyGroups);
         setAllPlayers(playersRes.players);
         loadOwnerPanelState();
       } catch {
         // Keep current visible feed/stories on transient background polling errors
       } finally {
+        feedInFlightRef.current = false;
         if (!silent) {
           setLoadingFeed(false);
         }
@@ -263,6 +270,8 @@ export default function App() {
   const [slowLoading, setSlowLoading] = useState(false);
   const autoRetryCountRef = useRef(0);
   const resolvedByServerRef = useRef(false);
+  const bootstrapInFlightRef = useRef(false);
+  const lastBackgroundSyncRef = useRef(0);
 
   const extractTelegramAuth = useCallback((debug = false) => {
     return readTelegramClientAuthSafe({ debug });
@@ -292,6 +301,8 @@ export default function App() {
 
   const bootstrap = useCallback(
     async (backgroundRefresh = false) => {
+      if (backgroundRefresh && bootstrapInFlightRef.current) return;
+      bootstrapInFlightRef.current = true;
       if (!backgroundRefresh) {
         resolvedByServerRef.current = false;
         setActivePlayerId(null);
@@ -303,11 +314,6 @@ export default function App() {
       }
       try {
         initTelegramWebAppSafe();
-        // Wait 500ms after ready() & expand() because Telegram WebApp user data often arrives slightly delayed
-        if (!backgroundRefresh) {
-          await new Promise((r) => setTimeout(r, 500));
-        }
-
         let auth = extractTelegramAuth(true);
         let inTelegram = Boolean(auth.isTelegramEnv || isTelegramMiniAppRef.current);
         if (inTelegram) {
@@ -316,8 +322,7 @@ export default function App() {
         }
 
         if (!auth.tgUser?.id && !auth.initData && !backgroundRefresh) {
-          // Retry at +500ms (total ~1s), then +1000ms (total ~2s)
-          for (const waitMs of [500, 1000]) {
+          for (const waitMs of [150, 350]) {
             await new Promise((r) => setTimeout(r, waitMs));
             auth = extractTelegramAuth(true);
             if (auth.isTelegramEnv) {
@@ -340,11 +345,25 @@ export default function App() {
 
         const { initData, tgUser } = auth;
         const immediateTgPlayer = tgUser?.id ? buildTelegramPlayerFromClient(tgUser) : null;
+        let prefetchedFeed = false;
         if (immediateTgPlayer) {
           setGuestMode(false);
           setCurrentUser(immediateTgPlayer);
-          if (immediateTgPlayer.is_owner) {
+          let hasCachedFollow = false;
+          try {
+            hasCachedFollow = localStorage.getItem(`nz_follows_owner_${tgUser!.id}`) === '1';
+          } catch {
+            hasCachedFollow = false;
+          }
+          if (immediateTgPlayer.is_owner || hasCachedFollow) {
+            if (hasCachedFollow && !immediateTgPlayer.is_owner) {
+              setCurrentUser({ ...immediateTgPlayer, follows_owner: true });
+            }
             setBootState('ready');
+            if (!backgroundRefresh) {
+              prefetchedFeed = true;
+              loadFeedAndStories(false).catch(() => {});
+            }
           }
         }
 
@@ -445,13 +464,24 @@ export default function App() {
           meRes.ownerPlayer ||
           (meRes.players || []).find((p) => p.is_owner || p.telegram_id === 6189849073) ||
           null;
+        if (resolvedPlayer.telegram_id && (resolvedPlayer.is_owner || resolvedPlayer.follows_owner === true)) {
+          try {
+            localStorage.setItem(`nz_follows_owner_${resolvedPlayer.telegram_id}`, '1');
+          } catch {
+            // ignore storage errors
+          }
+        }
         setOwnerPlayer(resolvedOwner);
         setCurrentUser(resolvedPlayer);
         setAllPlayers(meRes.players || [resolvedPlayer]);
         setBootState('ready');
 
         if (resolvedPlayer.is_owner || resolvedPlayer.follows_owner === true) {
-          Promise.allSettled([loadFeedAndStories(backgroundRefresh), loadNotificationsAndChats()]).catch(() => {});
+          const tasks: Promise<any>[] = [loadNotificationsAndChats()];
+          if (!prefetchedFeed) {
+            tasks.unshift(loadFeedAndStories(backgroundRefresh));
+          }
+          Promise.allSettled(tasks).catch(() => {});
         }
       } catch (err: any) {
         const latestAuth = extractTelegramAuth(false);
@@ -497,6 +527,8 @@ export default function App() {
         } else if (!backgroundRefresh) {
           enterGuestMode(insideTg);
         }
+      } finally {
+        bootstrapInFlightRef.current = false;
       }
     },
     [enterGuestMode, extractTelegramAuth, loadFeedAndStories, loadNotificationsAndChats]
@@ -527,17 +559,23 @@ export default function App() {
   useEffect(() => {
     document.title = 'NONGKRONG ZONE - Tempat Nongkrong Anak Muda';
     initTelegramWebAppSafe();
-    const fadeTimer = setTimeout(() => {
-      setSplashPhase('fading');
-    }, 2150);
-    const doneTimer = setTimeout(() => {
-      setSplashPhase('done');
-    }, 2500);
+    const maxFade = setTimeout(() => setSplashPhase((p) => (p === 'showing' ? 'fading' : p)), 1050);
+    const maxDone = setTimeout(() => setSplashPhase('done'), 1350);
     return () => {
-      clearTimeout(fadeTimer);
-      clearTimeout(doneTimer);
+      clearTimeout(maxFade);
+      clearTimeout(maxDone);
     };
   }, []);
+
+  useEffect(() => {
+    if (bootState === 'loading' || splashPhase !== 'showing') return;
+    const tFade = setTimeout(() => setSplashPhase('fading'), 450);
+    const tDone = setTimeout(() => setSplashPhase('done'), 720);
+    return () => {
+      clearTimeout(tFade);
+      clearTimeout(tDone);
+    };
+  }, [bootState, splashPhase]);
 
   useEffect(() => {
     bootstrap(false);
@@ -594,17 +632,20 @@ export default function App() {
   // Universal background sync & foreground resume sync across all phones/devices (works on Node, Cloud Run, & Vercel)
   useEffect(() => {
     if (bootState !== 'ready' || !currentUser || isStaticSpaHost()) return;
-    const runSync = () => {
+    const runSync = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastBackgroundSyncRef.current < 3500) return;
+      lastBackgroundSyncRef.current = now;
       loadFeedAndStories(true);
       if (!currentUser.is_guest) {
         loadNotificationsAndChats();
       }
       setActivitySyncVersion((v) => v + 1);
     };
-    const syncTimer = setInterval(runSync, 10000);
+    const syncTimer = setInterval(() => runSync(true), 15000);
     const onFocusOrVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      runSync();
+      runSync(false);
     };
     window.addEventListener('focus', onFocusOrVisible);
     document.addEventListener('visibilitychange', onFocusOrVisible);
@@ -758,13 +799,20 @@ export default function App() {
             } else if (parsed.event === 'chat:read') {
               loadNotificationsAndChats();
             } else if (parsed.event === 'post:created' && parsed.payload) {
-              setPosts((prev) => {
-                if (prev.some((p) => p.id === parsed.payload.id)) return prev;
-                return [parsed.payload, ...prev];
-              });
+              if (parsed.payload.original_post_id) {
+                setRepostCache((prev) =>
+                  prev.some((p) => p.id === parsed.payload.id) ? prev : [parsed.payload, ...prev]
+                );
+              } else {
+                setPosts((prev) => {
+                  if (prev.some((p) => p.id === parsed.payload.id)) return prev;
+                  return [parsed.payload, ...prev];
+                });
+              }
               setActivitySyncVersion((v) => v + 1);
             } else if (parsed.event === 'post:deleted' && parsed.payload?.id) {
               setPosts((prev) => prev.filter((p) => p.id !== parsed.payload.id));
+              setRepostCache((prev) => prev.filter((p) => p.id !== parsed.payload.id));
               setActivitySyncVersion((v) => v + 1);
             } else if (parsed.event === 'post:updated' && parsed.payload?.id) {
               setPosts((prev) =>
@@ -810,14 +858,9 @@ export default function App() {
     };
 
     connect();
-    const pollTimer = setInterval(() => {
-      loadNotificationsAndChats();
-      loadOwnerPanelState();
-    }, 15000);
 
     return () => {
       closedByCleanup = true;
-      clearInterval(pollTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
@@ -1060,9 +1103,14 @@ export default function App() {
       repost_caption: repostCaption || undefined,
       media_type: 'text',
     });
-    setPosts((prev) => {
-      if (prev.some((p) => p.id === res.post.id)) return prev;
-      return [res.post, ...prev];
+    if (res.post) {
+      setRepostCache((prev) => (prev.some((p) => p.id === res.post.id) ? prev : [res.post, ...prev]));
+    }
+    setActivitySyncVersion((v) => v + 1);
+    showTransferToast({
+      id: `repost-${Date.now()}`,
+      kind: 'sent',
+      text: 'Berhasil direpost! Tersimpan di tab Repost profil kamu.',
     });
   };
 
@@ -1073,6 +1121,7 @@ export default function App() {
     }
     await api.deletePost(postId);
     setPosts((prev) => prev.filter((p) => p.id !== postId));
+    setRepostCache((prev) => prev.filter((p) => p.id !== postId));
   };
 
   const handleBlockUser = async (target: Player) => {
@@ -1334,8 +1383,7 @@ export default function App() {
     currentUser &&
       (currentUser.is_owner ||
         currentUser.role === 'owner' ||
-        currentUser.telegram_id === 6189849073 ||
-        String(currentUser.username || '').toLowerCase() === 'afz')
+        currentUser.telegram_id === 6189849073)
   );
 
   const mustFollowOwner = Boolean(
@@ -1461,6 +1509,8 @@ export default function App() {
             <ProfileView
               username={viewingUsername}
               currentUser={currentUser}
+              initialPosts={profileSeedPosts}
+              knownPlayers={allPlayers}
               onBack={() => setViewingUsername(null)}
               onOpenProfile={handleOpenProfile}
               onOpenChatWith={(peer) => {
@@ -1472,6 +1522,18 @@ export default function App() {
               onOpenComments={setCommentsPost}
               onOpenTransferCoin={openTransferModal}
               onRequireTelegram={requireTelegramToast}
+              onPostCreatedOrReposted={(newPost) => {
+                if (newPost?.original_post_id) {
+                  setRepostCache((prev) => (prev.some((p) => p.id === newPost.id) ? prev : [newPost, ...prev]));
+                } else if (newPost) {
+                  setPosts((prev) => (prev.some((p) => p.id === newPost.id) ? prev : [newPost, ...prev]));
+                }
+                setActivitySyncVersion((v) => v + 1);
+              }}
+              onPostDeleted={(postId) => {
+                setPosts((prev) => prev.filter((p) => p.id !== postId));
+                setRepostCache((prev) => prev.filter((p) => p.id !== postId));
+              }}
               syncVersion={activitySyncVersion}
             />
           ) : activeTab === 'feed' ? (
@@ -1586,11 +1648,11 @@ export default function App() {
                 }}
               />
 
-              {loadingFeed && posts.length === 0 ? (
+              {loadingFeed && homePosts.length === 0 ? (
                 <div className="py-16 text-center text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
                   Memuat postingan...
                 </div>
-              ) : posts.length === 0 ? (
+              ) : homePosts.length === 0 ? (
                 <div
                   className="py-24 flex flex-col items-center justify-center gap-2"
                   style={{ color: 'var(--nz-text-muted)' }}
@@ -1599,7 +1661,7 @@ export default function App() {
                   <p className="text-[13px]">Belum ada postingan</p>
                 </div>
               ) : (
-                posts.map((post) => (
+                homePosts.map((post) => (
                   <PostCard
                     key={post.id}
                     post={post}
@@ -1636,6 +1698,17 @@ export default function App() {
               onOpenProfile={handleOpenProfile}
               onOpenComments={setCommentsPost}
               onRequireTelegram={requireTelegramToast}
+              onReposted={(repost) => {
+                if (repost) {
+                  setRepostCache((prev) => (prev.some((p) => p.id === repost.id) ? prev : [repost, ...prev]));
+                }
+                setActivitySyncVersion((v) => v + 1);
+                showTransferToast({
+                  id: `repost-explore-${Date.now()}`,
+                  kind: 'sent',
+                  text: 'Berhasil direpost! Tersimpan di tab Repost profil kamu.',
+                });
+              }}
             />
           ) : activeTab === 'borders' ? (
             <BordersView
@@ -1643,13 +1716,15 @@ export default function App() {
               onBack={() => setActiveTab('profile')}
               onPlayerUpdated={(updated) => {
                 setCurrentUser(updated);
-                loadFeedAndStories();
+                loadFeedAndStories(true);
               }}
             />
           ) : (
             <ProfileView
               username={currentUser.username}
               currentUser={currentUser}
+              initialPosts={profileSeedPosts}
+              knownPlayers={allPlayers}
               onOpenProfile={handleOpenProfile}
               onOpenChatWith={(peer) => {
                 setChatInitialPeer(peer);
@@ -1668,6 +1743,18 @@ export default function App() {
                 setOwnerPanelOpen(true);
               }}
               onRequireTelegram={requireTelegramToast}
+              onPostCreatedOrReposted={(newPost) => {
+                if (newPost?.original_post_id) {
+                  setRepostCache((prev) => (prev.some((p) => p.id === newPost.id) ? prev : [newPost, ...prev]));
+                } else if (newPost) {
+                  setPosts((prev) => (prev.some((p) => p.id === newPost.id) ? prev : [newPost, ...prev]));
+                }
+                setActivitySyncVersion((v) => v + 1);
+              }}
+              onPostDeleted={(postId) => {
+                setPosts((prev) => prev.filter((p) => p.id !== postId));
+                setRepostCache((prev) => prev.filter((p) => p.id !== postId));
+              }}
               syncVersion={activitySyncVersion}
             />
           )}
@@ -1802,8 +1889,16 @@ export default function App() {
             currentUser={currentUser}
             allPlayers={allPlayers}
             onClose={() => setCreateMode(null)}
-            onCreatedPost={loadFeedAndStories}
-            onCreatedStory={loadFeedAndStories}
+            onCreatedPost={(createdPost) => {
+              if (createdPost && !createdPost.original_post_id) {
+                setPosts((prev) =>
+                  prev.some((p) => p.id === createdPost.id) ? prev : [createdPost, ...prev]
+                );
+                setActivitySyncVersion((v) => v + 1);
+              }
+              loadFeedAndStories(true);
+            }}
+            onCreatedStory={() => loadFeedAndStories(true)}
           />
         )}
 
@@ -1907,8 +2002,8 @@ export default function App() {
             onTransferSuccess={({ senderCoins, recipient, amount }) => {
               const isSenderOwner = Boolean(
                 currentUser.is_owner ||
-                  currentUser.telegram_id === 6189849073 ||
-                  String(currentUser.username || '').toLowerCase() === 'afz'
+                  currentUser.role === 'owner' ||
+                  currentUser.telegram_id === 6189849073
               );
               if (!isSenderOwner) {
                 setCurrentUser((prev) => (prev ? { ...prev, coins: senderCoins } : prev));
@@ -1935,6 +2030,14 @@ export default function App() {
             stats={ownerStats}
             onClose={() => setOwnerPanelOpen(false)}
             onStateChanged={loadOwnerPanelState}
+            onViewProfile={(username) => {
+              setOwnerPanelOpen(false);
+              handleOpenProfile(username);
+            }}
+            onTransferToUser={(player) => {
+              setOwnerPanelOpen(false);
+              openTransferModal(player);
+            }}
           />
         )}
 

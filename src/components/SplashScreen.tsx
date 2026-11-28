@@ -169,7 +169,7 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({ fadingOut }) => {
             className="h-full rounded-full bg-gradient-to-r from-[#FACC15] via-[#FF9F0A] to-[#FEF08A]"
             style={{
               boxShadow: '0 0 12px rgba(250, 204, 21, 0.9)',
-              animation: 'loading-bar-fill 2.35s cubic-bezier(0.22, 1, 0.36, 1) forwards',
+              animation: 'loading-bar-fill 0.85s cubic-bezier(0.22, 1, 0.36, 1) forwards',
             }}
           />
         </div>

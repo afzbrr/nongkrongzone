@@ -96,7 +96,7 @@ async function detectAuthSchemaCaps(sb: SupabaseClient) {
       const quickProbe = (table: string, col: string) =>
         Promise.race([
           sb.from(table).select(col).limit(1).then((r) => !r.error, () => false),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1500)),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1200)),
         ]);
       const [hasTgAv, hasProf] = await Promise.all([
         quickProbe('players', 'telegram_avatar_url'),
@@ -119,133 +119,146 @@ async function detectSchemaCaps(sb: SupabaseClient) {
   if (schemaCapsPromise) return schemaCapsPromise;
   schemaCapsPromise = (async () => {
     try {
+      const fetchRowKeys = (table: string) =>
+        Promise.race([
+          sb
+            .from(table)
+            .select('*')
+            .limit(1)
+            .then(
+              (r) => ({ ok: !r.error, keys: r.data?.[0] ? new Set(Object.keys(r.data[0])) : null }),
+              () => ({ ok: false, keys: null as Set<string> | null })
+            ),
+          new Promise<{ ok: boolean; keys: Set<string> | null }>((resolve) =>
+            setTimeout(() => resolve({ ok: false, keys: null }), 1500)
+          ),
+        ]);
+
       const colProbe = (table: string, col: string) =>
         Promise.race([
           sb.from(table).select(col).limit(1).then((r) => !r.error, () => false),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 4000)),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1200)),
         ]);
 
-    const [
-      hasTgAv,
-      hasProf,
-      pPid,
-      pTgId,
-      pUser,
-      pFull,
-      pAv,
-      pMUrl,
-      pMUrls,
-      pLikes,
-      pLikesC,
-      pCommsC,
-      pIsDel,
-      pTag,
-      pOrig,
-      lId,
-      lPid,
-      lTgId,
-      cPid,
-      cTgId,
-      cUser,
-      cFull,
-      cAv,
-      cText,
-      cComment,
-      cParent,
-      cIsDel,
-      cLikesC,
-      sPid,
-      sTgId,
-      sUser,
-      sFull,
-      sAv,
-      sText,
-      sCap,
-      sBg,
-      sDur,
-      sIsDel,
-      sSong,
-    ] = await Promise.all([
-      colProbe('players', 'telegram_avatar_url'),
-      colProbe('profiles', 'id'),
-      colProbe('posts', 'player_id'),
-      colProbe('posts', 'telegram_id'),
-      colProbe('posts', 'username'),
-      colProbe('posts', 'full_name'),
-      colProbe('posts', 'avatar_url'),
-      colProbe('posts', 'media_url'),
-      colProbe('posts', 'media_urls'),
-      colProbe('posts', 'likes'),
-      colProbe('posts', 'likes_count'),
-      colProbe('posts', 'comments_count'),
-      colProbe('posts', 'is_deleted'),
-      colProbe('posts', 'tagged_usernames'),
-      colProbe('posts', 'original_post_id'),
-      colProbe('post_likes', 'id'),
-      colProbe('post_likes', 'player_id'),
-      colProbe('post_likes', 'telegram_id'),
-      colProbe('post_comments', 'player_id'),
-      colProbe('post_comments', 'telegram_id'),
-      colProbe('post_comments', 'username'),
-      colProbe('post_comments', 'full_name'),
-      colProbe('post_comments', 'avatar_url'),
-      colProbe('post_comments', 'text'),
-      colProbe('post_comments', 'comment'),
-      colProbe('post_comments', 'parent_comment_id'),
-      colProbe('post_comments', 'is_deleted'),
-      colProbe('post_comments', 'likes_count'),
-      colProbe('stories', 'player_id'),
-      colProbe('stories', 'telegram_id'),
-      colProbe('stories', 'username'),
-      colProbe('stories', 'full_name'),
-      colProbe('stories', 'avatar_url'),
-      colProbe('stories', 'text'),
-      colProbe('stories', 'caption'),
-      colProbe('stories', 'bg_color'),
-      colProbe('stories', 'duration_hours'),
-      colProbe('stories', 'is_deleted'),
-      colProbe('stories', 'song_title'),
-    ]);
+      const [playersRow, profilesRow, postsRow, likesRow, commentsRow, storiesRow] = await Promise.all([
+        fetchRowKeys('players'),
+        fetchRowKeys('profiles'),
+        fetchRowKeys('posts'),
+        fetchRowKeys('post_likes'),
+        fetchRowKeys('post_comments'),
+        fetchRowKeys('stories'),
+      ]);
 
-    schemaCaps.hasTelegramAvatarCol = hasTgAv;
-    schemaCaps.hasProfilesTable = hasProf;
-    schemaCaps.postsPlayerId = pPid;
-    schemaCaps.postsTelegramId = pTgId;
-    schemaCaps.postsUsername = pUser;
-    schemaCaps.postsFullName = pFull;
-    schemaCaps.postsAvatarUrl = pAv;
-    schemaCaps.postsMediaUrl = pMUrl;
-    schemaCaps.postsMediaUrls = pMUrls;
-    schemaCaps.postsLikes = pLikes;
-    schemaCaps.postsLikesCount = pLikesC;
-    schemaCaps.postsCommentsCount = pCommsC;
-    schemaCaps.postsIsDeleted = pIsDel;
-    schemaCaps.postsTaggedUsernames = pTag;
-    schemaCaps.postsOriginalPostId = pOrig;
-    schemaCaps.likesId = lId;
-    schemaCaps.likesPlayerId = lPid;
-    schemaCaps.likesTelegramId = lTgId;
-    schemaCaps.commentsPlayerId = cPid;
-    schemaCaps.commentsTelegramId = cTgId;
-    schemaCaps.commentsUsername = cUser;
-    schemaCaps.commentsFullName = cFull;
-    schemaCaps.commentsAvatarUrl = cAv;
-    schemaCaps.commentsText = cText;
-    schemaCaps.commentsComment = cComment;
-    schemaCaps.commentsParentId = cParent;
-    schemaCaps.commentsIsDeleted = cIsDel;
-    schemaCaps.commentsLikesCount = cLikesC;
-    schemaCaps.storiesPlayerId = sPid;
-    schemaCaps.storiesTelegramId = sTgId;
-    schemaCaps.storiesUsername = sUser;
-    schemaCaps.storiesFullName = sFull;
-    schemaCaps.storiesAvatarUrl = sAv;
-    schemaCaps.storiesText = sText;
-    schemaCaps.storiesCaption = sCap;
-    schemaCaps.storiesBgColor = sBg;
-    schemaCaps.storiesDurationHours = sDur;
-    schemaCaps.storiesIsDeleted = sIsDel;
-    schemaCaps.storiesSongTitle = sSong;
+      schemaCaps.hasProfilesTable = profilesRow.ok;
+      if (playersRow.keys) {
+        schemaCaps.hasTelegramAvatarCol = playersRow.keys.has('telegram_avatar_url');
+      } else {
+        schemaCaps.hasTelegramAvatarCol = await colProbe('players', 'telegram_avatar_url');
+      }
+
+      if (postsRow.keys) {
+        const k = postsRow.keys;
+        schemaCaps.postsPlayerId = k.has('player_id');
+        schemaCaps.postsTelegramId = k.has('telegram_id');
+        schemaCaps.postsUsername = k.has('username');
+        schemaCaps.postsFullName = k.has('full_name');
+        schemaCaps.postsAvatarUrl = k.has('avatar_url');
+        schemaCaps.postsMediaUrl = k.has('media_url');
+        schemaCaps.postsMediaUrls = k.has('media_urls');
+        schemaCaps.postsLikes = k.has('likes');
+        schemaCaps.postsLikesCount = k.has('likes_count');
+        schemaCaps.postsCommentsCount = k.has('comments_count');
+        schemaCaps.postsIsDeleted = k.has('is_deleted');
+        schemaCaps.postsTaggedUsernames = k.has('tagged_usernames');
+        schemaCaps.postsOriginalPostId = k.has('original_post_id');
+      } else {
+        const [pPid, pMUrls, pLikesC, pCommsC, pIsDel, pTag, pOrig] = await Promise.all([
+          colProbe('posts', 'player_id'),
+          colProbe('posts', 'media_urls'),
+          colProbe('posts', 'likes_count'),
+          colProbe('posts', 'comments_count'),
+          colProbe('posts', 'is_deleted'),
+          colProbe('posts', 'tagged_usernames'),
+          colProbe('posts', 'original_post_id'),
+        ]);
+        schemaCaps.postsPlayerId = pPid;
+        schemaCaps.postsMediaUrls = pMUrls;
+        schemaCaps.postsLikesCount = pLikesC;
+        schemaCaps.postsCommentsCount = pCommsC;
+        schemaCaps.postsIsDeleted = pIsDel;
+        schemaCaps.postsTaggedUsernames = pTag;
+        schemaCaps.postsOriginalPostId = pOrig;
+      }
+
+      if (likesRow.keys) {
+        const k = likesRow.keys;
+        schemaCaps.likesId = k.has('id');
+        schemaCaps.likesPlayerId = k.has('player_id');
+        schemaCaps.likesTelegramId = k.has('telegram_id');
+      } else {
+        const [lId, lPid, lTgId] = await Promise.all([
+          colProbe('post_likes', 'id'),
+          colProbe('post_likes', 'player_id'),
+          colProbe('post_likes', 'telegram_id'),
+        ]);
+        schemaCaps.likesId = lId;
+        schemaCaps.likesPlayerId = lPid;
+        schemaCaps.likesTelegramId = lTgId;
+      }
+
+      if (commentsRow.keys) {
+        const k = commentsRow.keys;
+        schemaCaps.commentsPlayerId = k.has('player_id');
+        schemaCaps.commentsTelegramId = k.has('telegram_id');
+        schemaCaps.commentsUsername = k.has('username');
+        schemaCaps.commentsFullName = k.has('full_name');
+        schemaCaps.commentsAvatarUrl = k.has('avatar_url');
+        schemaCaps.commentsText = k.has('text');
+        schemaCaps.commentsComment = k.has('comment');
+        schemaCaps.commentsParentId = k.has('parent_comment_id');
+        schemaCaps.commentsIsDeleted = k.has('is_deleted');
+        schemaCaps.commentsLikesCount = k.has('likes_count');
+      } else {
+        const [cPid, cText, cParent, cIsDel, cLikesC] = await Promise.all([
+          colProbe('post_comments', 'player_id'),
+          colProbe('post_comments', 'text'),
+          colProbe('post_comments', 'parent_comment_id'),
+          colProbe('post_comments', 'is_deleted'),
+          colProbe('post_comments', 'likes_count'),
+        ]);
+        schemaCaps.commentsPlayerId = cPid;
+        schemaCaps.commentsText = cText;
+        schemaCaps.commentsParentId = cParent;
+        schemaCaps.commentsIsDeleted = cIsDel;
+        schemaCaps.commentsLikesCount = cLikesC;
+      }
+
+      if (storiesRow.keys) {
+        const k = storiesRow.keys;
+        schemaCaps.storiesPlayerId = k.has('player_id');
+        schemaCaps.storiesTelegramId = k.has('telegram_id');
+        schemaCaps.storiesUsername = k.has('username');
+        schemaCaps.storiesFullName = k.has('full_name');
+        schemaCaps.storiesAvatarUrl = k.has('avatar_url');
+        schemaCaps.storiesText = k.has('text');
+        schemaCaps.storiesCaption = k.has('caption');
+        schemaCaps.storiesBgColor = k.has('bg_color');
+        schemaCaps.storiesDurationHours = k.has('duration_hours');
+        schemaCaps.storiesIsDeleted = k.has('is_deleted');
+        schemaCaps.storiesSongTitle = k.has('song_title');
+      } else {
+        const [sPid, sCap, sIsDel, sSong] = await Promise.all([
+          colProbe('stories', 'player_id'),
+          colProbe('stories', 'caption'),
+          colProbe('stories', 'is_deleted'),
+          colProbe('stories', 'song_title'),
+        ]);
+        schemaCaps.storiesPlayerId = sPid;
+        schemaCaps.storiesCaption = sCap;
+        schemaCaps.storiesIsDeleted = sIsDel;
+        schemaCaps.storiesSongTitle = sSong;
+      }
+      authCapsChecked = true;
     } catch {
       // keep defaults
     } finally {
@@ -265,8 +278,7 @@ function isUnlimitedOwner(row: any): boolean {
   return Boolean(
     isOwnerByTelegramId(row.telegram_id) ||
       row.is_owner === true ||
-      String(row.role || '').trim().toLowerCase() === 'owner' ||
-      String(row.username || '').trim().toLowerCase() === 'afz'
+      String(row.role || '').trim().toLowerCase() === 'owner'
   );
 }
 
@@ -1082,7 +1094,8 @@ async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId
         .from('posts')
         .select('*', { count: 'exact', head: true })
         .eq('player_id', normalizedTarget.id)
-        .eq('is_deleted', false),
+        .eq('is_deleted', false)
+        .is('original_post_id', null),
       viewerId
         ? sb
             .from('follows')
@@ -1149,11 +1162,147 @@ async function resolveOwnerAndFollowStatus(sb: SupabaseClient, viewer: any) {
   return { ownerPlayer: normalizedOwner, followsOwner };
 }
 
+let legacyOwnerCleanupPromise: Promise<void> | null = null;
+let legacyOwnerCleaned = false;
+
+function isLegacyDuplicateOwnerRow(row: any): boolean {
+  if (!row) return false;
+  const hasTg =
+    row.telegram_id !== null &&
+    row.telegram_id !== undefined &&
+    Number(row.telegram_id) > 0;
+  if (hasTg) return false;
+  const uname = String(row.username || '').trim().toLowerCase();
+  const name = String(row.name || '').trim().toLowerCase();
+  return uname === 'afz' || name === 'faiz owner';
+}
+
+async function cleanupLegacyDuplicateOwnerAccount(sb: SupabaseClient): Promise<void> {
+  if (legacyOwnerCleaned) return;
+  if (legacyOwnerCleanupPromise) return legacyOwnerCleanupPromise;
+
+  legacyOwnerCleanupPromise = (async () => {
+    try {
+      const [{ data: realOwner }, { data: legacyRows }] = await Promise.all([
+        sb.from('players').select('*').eq('telegram_id', OWNER_TELEGRAM_ID).maybeSingle(),
+        sb
+          .from('players')
+          .select('*')
+          .is('telegram_id', null)
+          .or('username.ilike.afz,name.ilike.Faiz Owner'),
+      ]);
+
+      if (!realOwner || !legacyRows || legacyRows.length === 0) {
+        legacyOwnerCleaned = true;
+        return;
+      }
+
+      const targetOwnerId = realOwner.id;
+      for (const legacy of legacyRows) {
+        if (!legacy?.id || legacy.id === targetOwnerId || !isLegacyDuplicateOwnerRow(legacy)) {
+          continue;
+        }
+        const legacyId = legacy.id;
+
+        const safeUpdate = async (table: string, col: string) => {
+          try {
+            await sb.from(table).update({ [col]: targetOwnerId }).eq(col, legacyId);
+          } catch {
+            // ignore missing tables or unique conflicts
+          }
+        };
+        const safeDelete = async (table: string, col: string) => {
+          try {
+            await sb.from(table).delete().eq(col, legacyId);
+          } catch {
+            // ignore missing tables or constraint checks
+          }
+        };
+
+        await Promise.allSettled([
+          safeUpdate('posts', 'player_id'),
+          safeUpdate('post_comments', 'player_id'),
+          safeUpdate('stories', 'player_id'),
+          safeUpdate('messages', 'sender_id'),
+          safeUpdate('messages', 'receiver_id'),
+          safeUpdate('notifications', 'user_id'),
+          safeUpdate('notifications', 'to_player_id'),
+          safeUpdate('notifications', 'from_player_id'),
+          safeUpdate('transactions', 'sender_id'),
+          safeUpdate('transactions', 'receiver_id'),
+          safeUpdate('transactions', 'from_player_id'),
+          safeUpdate('transactions', 'to_player_id'),
+          safeUpdate('broadcasts', 'created_by'),
+          safeUpdate('giveaways', 'created_by'),
+          safeUpdate('follows', 'following_id'),
+          safeUpdate('follows', 'follower_id'),
+          safeUpdate('post_likes', 'player_id'),
+          safeUpdate('story_views', 'player_id'),
+          safeUpdate('story_reacts', 'player_id'),
+          safeUpdate('player_borders', 'player_id'),
+          safeUpdate('group_members', 'player_id'),
+          safeUpdate('giveaway_claims', 'user_id'),
+          safeUpdate('giveaway_claims', 'player_id'),
+        ]);
+
+        // Prevent accidental self-follow if legacy followed realOwner
+        try {
+          await sb
+            .from('follows')
+            .delete()
+            .eq('follower_id', targetOwnerId)
+            .eq('following_id', targetOwnerId);
+        } catch {
+          // ignore
+        }
+
+        // Remove any remaining conflicting/junction rows still pointing to legacyId
+        await Promise.allSettled([
+          safeDelete('post_likes', 'player_id'),
+          safeDelete('story_views', 'player_id'),
+          safeDelete('story_reacts', 'player_id'),
+          safeDelete('follows', 'follower_id'),
+          safeDelete('follows', 'following_id'),
+          safeDelete('blocks', 'blocker_id'),
+          safeDelete('blocks', 'blocked_id'),
+          safeDelete('group_members', 'player_id'),
+          safeDelete('player_borders', 'player_id'),
+          safeDelete('giveaway_claims', 'user_id'),
+          safeDelete('giveaway_claims', 'player_id'),
+          safeDelete('profiles', 'id'),
+        ]);
+
+        try {
+          await sb.from('profiles').delete().is('telegram_id', null).ilike('username', 'afz');
+        } catch {
+          // ignore
+        }
+
+        const { error: delErr } = await sb.from('players').delete().eq('id', legacyId);
+        if (delErr) {
+          console.warn('[cleanupLegacyDuplicateOwnerAccount] Failed deleting legacy owner row:', delErr.message);
+        }
+      }
+      legacyOwnerCleaned = true;
+    } catch (err: any) {
+      console.warn('[cleanupLegacyDuplicateOwnerAccount] Warning:', err?.message || err);
+    } finally {
+      legacyOwnerCleanupPromise = null;
+    }
+  })();
+
+  return legacyOwnerCleanupPromise;
+}
+
 let cachedAppPromise: Promise<express.Express> | null = null;
 
 export async function createApp(): Promise<express.Express> {
   if (cachedAppPromise) return cachedAppPromise;
   cachedAppPromise = (async () => {
+  const startupSb = getSupabase();
+  if (startupSb) {
+    await cleanupLegacyDuplicateOwnerAccount(startupSb);
+  }
   const app = express();
   app.set('trust proxy', 1);
   app.use((req: any, _res: Response, next: (e?: any) => void) => {
@@ -1776,7 +1925,9 @@ export async function createApp(): Promise<express.Express> {
         .gte('created_at', todayStartIso),
     ]);
 
-    const playerRows = (playersRes.data || []).filter((p: any) => !p.is_banned);
+    const playerRows = (playersRes.data || []).filter(
+      (p: any) => !p.is_banned && !isLegacyDuplicateOwnerRow(p)
+    );
     const totalUsers = playerRows.length;
     const totalCoinsCirculating = playerRows.reduce((sum: number, p: any) => {
       if (isUnlimitedOwner(p)) return sum;
@@ -1887,6 +2038,65 @@ export async function createApp(): Promise<express.Express> {
       return res.json(state);
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memuat data panel owner' });
+    }
+  });
+
+  // Owner-only: inspect live coin balances of all mini-app users
+  app.get('/api/owner/users-coins', async (req: Request, res: Response) => {
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
+    try {
+      await cleanupLegacyDuplicateOwnerAccount(sb);
+      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      if (!isUnlimitedOwner(me)) {
+        return res.status(403).json({ error: 'Hanya Owner yang dapat melihat daftar coin pengguna' });
+      }
+
+      const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+      let query = sb
+        .from('players')
+        .select('*')
+        .order('is_owner', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1000);
+
+      if (q) {
+        const safeQ = q.replace(/[%_,()]/g, '');
+        if (safeQ) {
+          query = query.or(`username.ilike.%${safeQ}%,name.ilike.%${safeQ}%`);
+        }
+      }
+
+      const { data: rows, error } = await query;
+      if (error) throw error;
+
+      const users = (rows || [])
+        .filter((p) => !isLegacyDuplicateOwnerRow(p))
+        .map((p) => normalizePlayer(p))
+        .sort((a, b) => {
+          const aOwner = a.is_owner ? 1 : 0;
+          const bOwner = b.is_owner ? 1 : 0;
+          if (aOwner !== bOwner) return bOwner - aOwner;
+          return Number(b.coins || 0) - Number(a.coins || 0);
+        });
+
+      const activeUsers = users.filter((u) => !u.is_banned);
+      const totalUsers = activeUsers.length;
+      const totalCoinsCirculating = activeUsers.reduce((sum, u) => {
+        if (u.is_owner) return sum;
+        return sum + Number(u.coins || 0);
+      }, 0);
+
+      return res.json({
+        users,
+        totalUsers,
+        totalCoinsCirculating,
+      });
+    } catch (err: any) {
+      if (err?.status === 401) {
+        return res.status(401).json({ error: err.message });
+      }
+      return res.status(500).json({ error: err?.message || 'Gagal memuat daftar coin pengguna' });
     }
   });
 
@@ -2273,7 +2483,7 @@ export async function createApp(): Promise<express.Express> {
         const { data: ownerPlayerRow } = await sb
           .from('players')
           .select('*')
-          .or(`telegram_id.eq.${OWNER_TELEGRAM_ID},username.ilike.afz`)
+          .eq('telegram_id', OWNER_TELEGRAM_ID)
           .limit(1)
           .maybeSingle();
 
@@ -2281,7 +2491,7 @@ export async function createApp(): Promise<express.Express> {
           senderId: ownerPlayerRow?.id || me.id,
           recipientId: me.id,
           amount: giveaway.amount_per_user,
-          senderUsername: ownerPlayerRow?.username || 'afz',
+          senderUsername: ownerPlayerRow?.username || OWNER_DEFAULT_USERNAME,
           recipientUsername: me.username,
           txType: 'giveaway',
           note: `Bagi-Bagi Coin (+${formatCoinsId(giveaway.amount_per_user)} coin)`,
@@ -2800,6 +3010,7 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
+      await cleanupLegacyDuplicateOwnerAccount(sb);
       const me = await resolveViewerOrGuest(sb, req);
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       let query = sb
@@ -2834,12 +3045,14 @@ export async function createApp(): Promise<express.Express> {
       if (error) throw error;
       const followingSet = new Set((followsRes.data || []).map((f) => f.following_id));
 
-      const players = (rows || []).map((p) => ({
-        ...normalizePlayer(p),
-        is_following: followingSet.has(p.id),
-        is_blocked_by_me: blocks.blockedByMe.has(p.id),
-        has_blocked_me: blocks.blockedMe.has(p.id),
-      }));
+      const players = (rows || [])
+        .filter((p) => !isLegacyDuplicateOwnerRow(p))
+        .map((p) => ({
+          ...normalizePlayer(p),
+          is_following: followingSet.has(p.id),
+          is_blocked_by_me: blocks.blockedByMe.has(p.id),
+          has_blocked_me: blocks.blockedMe.has(p.id),
+        }));
       return res.json({ players });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memuat pengguna' });
@@ -2870,6 +3083,7 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
+      await cleanupLegacyDuplicateOwnerAccount(sb);
       const me = await resolveViewerOrGuest(sb, req);
       const identifier = req.params.identifier;
       const query = isUuid(identifier)
@@ -2877,7 +3091,9 @@ export async function createApp(): Promise<express.Express> {
         : sb.from('players').select('*').ilike('username', identifier).maybeSingle();
       const { data: target, error } = await query;
       if (error) throw error;
-      if (!target) return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
+      if (!target || isLegacyDuplicateOwnerRow(target)) {
+        return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
+      }
       const enriched = await enrichPlayerStats(sb, target, me?.id || null);
       return res.json({ player: enriched });
     } catch (err: any) {
@@ -3144,8 +3360,7 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
-      const caps = await detectSchemaCaps(sb);
-      const me = await resolveViewerOrGuest(sb, req);
+      const [caps, me] = await Promise.all([detectSchemaCaps(sb), resolveViewerOrGuest(sb, req)]);
       const blocks = me?.id
         ? await getBlockedSet(sb, me.id)
         : {
@@ -3154,6 +3369,7 @@ export async function createApp(): Promise<express.Express> {
             anyBlocked: new Set<string>(),
           };
       const playerIdFilter = typeof req.query.playerId === 'string' ? req.query.playerId : null;
+      const includeReposts = req.query.includeReposts === '1';
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
 
       if (playerIdFilter && blocks.anyBlocked.has(playerIdFilter)) {
@@ -3168,6 +3384,10 @@ export async function createApp(): Promise<express.Express> {
 
       if (caps.postsIsDeleted) {
         query = query.eq('is_deleted', false);
+      }
+
+      if (!playerIdFilter && !includeReposts && caps.postsOriginalPostId) {
+        query = query.is('original_post_id', null);
       }
 
       if (playerIdFilter && isUuid(playerIdFilter)) {
