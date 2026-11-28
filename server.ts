@@ -994,7 +994,7 @@ async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
 async function resolveViewerOrGuest(sb: SupabaseClient, req: Request) {
   const resolved = await resolveAuthenticatedPlayerOnly(sb, req);
   if (resolved) return resolved;
-  if (req.header('x-guest-mode') === '1') {
+  if (req.header('x-guest-mode') === '1' || req.header('x-no-owner-fallback') === '1') {
     return null;
   }
   return ensureOwnerAndResolvePlayer(sb, req);
@@ -1165,6 +1165,13 @@ export async function createApp(): Promise<express.Express> {
       return res.status(400).json({ error: 'Format JSON tidak valid' });
     }
     return next(err);
+  });
+
+  app.use('/api', (_req: Request, res: Response, next: (e?: any) => void) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    return next();
   });
 
   // Serve uploaded files safely with path traversal confinement
@@ -1492,10 +1499,13 @@ export async function createApp(): Promise<express.Express> {
         .single();
       if (uErr) throw uErr;
 
+      const enrichedPlayer = await enrichPlayerStats(sb, updated, me.id);
+      broadcastToAll('player:updated', { player: enrichedPlayer });
+
       return res.json({
         ok: true,
         border_id: updated.border_id,
-        player: await enrichPlayerStats(sb, updated, me.id),
+        player: enrichedPlayer,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memakai border' });
@@ -2774,7 +2784,9 @@ export async function createApp(): Promise<express.Express> {
         enrichPlayerStats(sb, updated, me.id),
         resolveOwnerAndFollowStatus(sb, updated),
       ]);
-      return res.json({ player: { ...enriched, follows_owner: ownerState.followsOwner } });
+      const fullUpdatedPlayer = { ...enriched, follows_owner: ownerState.followsOwner };
+      broadcastToAll('player:updated', { player: fullUpdatedPlayer });
+      return res.json({ player: fullUpdatedPlayer });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal update profil' });
     }
@@ -2859,7 +2871,7 @@ export async function createApp(): Promise<express.Express> {
       const identifier = req.params.identifier;
       const query = isUuid(identifier)
         ? sb.from('players').select('*').eq('id', identifier).maybeSingle()
-        : sb.from('players').select('*').eq('username', identifier).maybeSingle();
+        : sb.from('players').select('*').ilike('username', identifier).maybeSingle();
       const { data: target, error } = await query;
       if (error) throw error;
       if (!target) return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
@@ -2959,6 +2971,7 @@ export async function createApp(): Promise<express.Express> {
       }
 
       const ownerState = await resolveOwnerAndFollowStatus(sb, me);
+      broadcastToAll('player:updated', { id: targetId });
       return res.json({ ok: true, follows_owner: ownerState.followsOwner });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal follow' });
@@ -2979,6 +2992,7 @@ export async function createApp(): Promise<express.Express> {
         .eq('following_id', targetId);
       if (error) throw error;
       const ownerState = await resolveOwnerAndFollowStatus(sb, me);
+      broadcastToAll('player:updated', { id: targetId });
       return res.json({ ok: true, follows_owner: ownerState.followsOwner });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal unfollow' });
@@ -3316,6 +3330,7 @@ export async function createApp(): Promise<express.Express> {
       broadcastToAll('post:created', hydrated);
       return res.status(201).json({ post: hydrated });
     } catch (err: any) {
+      const status = typeof err?.status === 'number' ? err.status : 500;
       const msg = String(err?.message || 'Gagal membuat postingan');
       if (msg.toLowerCase().includes('row-level security')) {
         return res.status(500).json({
@@ -3323,7 +3338,7 @@ export async function createApp(): Promise<express.Express> {
             'Supabase RLS memblokir INSERT ke tabel posts. Tambahkan SUPABASE_SERVICE_ROLE_KEY di Secrets atau izinkan policy INSERT tabel posts di Supabase.',
         });
       }
-      return res.status(500).json({ error: msg });
+      return res.status(status).json({ error: msg, ...(err?.code ? { code: err.code } : {}) });
     }
   });
 
@@ -3436,6 +3451,7 @@ export async function createApp(): Promise<express.Express> {
         await sb.from('posts').update(postLikeUpdate).eq('id', postId);
       }
 
+      broadcastToAll('post:updated', { id: postId, likes_count: likesCount });
       return res.json({ liked, likes_count: likesCount });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal like postingan' });
@@ -3616,6 +3632,7 @@ export async function createApp(): Promise<express.Express> {
         }
       }
 
+      broadcastToAll('post:updated', { id: postId, comments_count: commentsCount });
       return res.status(201).json({
         comment: {
           ...inserted,
@@ -3707,6 +3724,9 @@ export async function createApp(): Promise<express.Express> {
       } else {
         const { error } = await sb.from('post_comments').delete().eq('id', commentId);
         if (error) throw error;
+      }
+      if (existing.post_id) {
+        broadcastToAll('post:updated', { id: existing.post_id });
       }
       return res.json({ ok: true });
     } catch (err: any) {
@@ -3901,6 +3921,7 @@ export async function createApp(): Promise<express.Express> {
         .single();
 
       if (error) throw error;
+      broadcastToAll('story:updated', { reason: 'created', player_id: me.id });
       return res.status(201).json({
         story: {
           ...story,
@@ -3953,6 +3974,7 @@ export async function createApp(): Promise<express.Express> {
         const { error } = await sb.from('stories').delete().eq('id', storyId);
         if (error) throw error;
       }
+      broadcastToAll('story:updated', { reason: 'deleted', id: storyId });
       return res.json({ ok: true });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal menghapus story' });

@@ -36,12 +36,10 @@ export const BordersProvider: React.FC<{
   const [rlsHint, setRlsHint] = useState<string | null>(null);
 
   const refreshBorders = useCallback(async () => {
-    if (!playerId) return;
     setLoading(true);
     setError(null);
     try {
       const res = await api.getBorders();
-      console.log('[Borders] fetched:', { data: res.borders, ownedIds: res.ownedIds, rlsHint: res.rlsHint });
       setAllBorders(res.borders || []);
       setCollectionBorders(res.collectionBorders || []);
       setOwnedIds(new Set(res.ownedIds || []));

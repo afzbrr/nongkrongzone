@@ -166,22 +166,33 @@ export default function App() {
     }
   }, []);
 
-  const loadFeedAndStories = useCallback(async () => {
-    setLoadingFeed(true);
-    try {
-      const [postsRes, storiesRes, playersRes] = await Promise.all([
-        api.getPosts(),
-        api.getStories(),
-        api.getPlayers(),
-      ]);
-      setPosts(postsRes.posts);
-      setStoryGroups(storiesRes.storyGroups);
-      setAllPlayers(playersRes.players);
-      loadOwnerPanelState();
-    } finally {
-      setLoadingFeed(false);
-    }
-  }, [loadOwnerPanelState]);
+  const [activitySyncVersion, setActivitySyncVersion] = useState(0);
+
+  const loadFeedAndStories = useCallback(
+    async (silent = false) => {
+      if (!silent) {
+        setLoadingFeed(true);
+      }
+      try {
+        const [postsRes, storiesRes, playersRes] = await Promise.all([
+          api.getPosts(),
+          api.getStories(),
+          api.getPlayers(),
+        ]);
+        setPosts(postsRes.posts);
+        setStoryGroups(storiesRes.storyGroups);
+        setAllPlayers(playersRes.players);
+        loadOwnerPanelState();
+      } catch {
+        // Keep current visible feed/stories on transient background polling errors
+      } finally {
+        if (!silent) {
+          setLoadingFeed(false);
+        }
+      }
+    },
+    [loadOwnerPanelState]
+  );
 
   const loadNotificationsAndChats = useCallback(async () => {
     try {
@@ -440,7 +451,7 @@ export default function App() {
         setBootState('ready');
 
         if (resolvedPlayer.is_owner || resolvedPlayer.follows_owner === true) {
-          Promise.allSettled([loadFeedAndStories(), loadNotificationsAndChats()]).catch(() => {});
+          Promise.allSettled([loadFeedAndStories(backgroundRefresh), loadNotificationsAndChats()]).catch(() => {});
         }
       } catch (err: any) {
         const latestAuth = extractTelegramAuth(false);
@@ -567,6 +578,43 @@ export default function App() {
     return () => clearInterval(timer);
   }, [bootstrap, currentUser?.is_guest, extractTelegramAuth, isTelegramMiniApp]);
 
+  // If Telegram user is temporarily on a non-UUID client fallback ID, retry server login in background
+  useEffect(() => {
+    if (!currentUser || currentUser.is_guest) return;
+    const isRealUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      String(currentUser.id || '')
+    );
+    if (isRealUuid) return;
+    const retryTimer = setInterval(() => {
+      bootstrap(true);
+    }, 4000);
+    return () => clearInterval(retryTimer);
+  }, [bootstrap, currentUser]);
+
+  // Universal background sync & foreground resume sync across all phones/devices (works on Node, Cloud Run, & Vercel)
+  useEffect(() => {
+    if (bootState !== 'ready' || !currentUser || isStaticSpaHost()) return;
+    const runSync = () => {
+      loadFeedAndStories(true);
+      if (!currentUser.is_guest) {
+        loadNotificationsAndChats();
+      }
+      setActivitySyncVersion((v) => v + 1);
+    };
+    const syncTimer = setInterval(runSync, 10000);
+    const onFocusOrVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      runSync();
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      clearInterval(syncTimer);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [bootState, currentUser, loadFeedAndStories, loadNotificationsAndChats]);
+
   // Show manual retry button if network takes unusually long (never fabricate a fake Owner account)
   useEffect(() => {
     if (bootState !== 'loading') return;
@@ -589,10 +637,49 @@ export default function App() {
   // WebSocket real-time connection
   useEffect(() => {
     if (!currentUser?.id || currentUser.is_guest || isStaticSpaHost()) return;
+    const isRealUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      String(currentUser.id || '')
+    );
+    if (!isRealUuid) return;
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let wsOpened = false;
     let wsFailures = 0;
+
+    const patchAuthorAcrossFeed = (updatedPlayer: Player) => {
+      if (!updatedPlayer?.id) return;
+      setAllPlayers((prev) => {
+        const exists = prev.some((p) => p.id === updatedPlayer.id);
+        return exists
+          ? prev.map((p) => (p.id === updatedPlayer.id ? { ...p, ...updatedPlayer } : p))
+          : [...prev, updatedPlayer];
+      });
+      setOwnerPlayer((prev) =>
+        prev && prev.id === updatedPlayer.id ? { ...prev, ...updatedPlayer } : prev
+      );
+      setPosts((prev) =>
+        prev.map((post) => {
+          const nextPlayer =
+            post.player && post.player.id === updatedPlayer.id
+              ? { ...post.player, ...updatedPlayer }
+              : post.player;
+          const nextOrig =
+            post.original_post && post.original_post.player?.id === updatedPlayer.id
+              ? {
+                  ...post.original_post,
+                  player: { ...post.original_post.player, ...updatedPlayer },
+                }
+              : post.original_post;
+          if (nextPlayer === post.player && nextOrig === post.original_post) return post;
+          return { ...post, player: nextPlayer, original_post: nextOrig };
+        })
+      );
+      setStoryGroups((prev) =>
+        prev.map((g) =>
+          g.player.id === updatedPlayer.id ? { ...g, player: { ...g.player, ...updatedPlayer } } : g
+        )
+      );
+    };
 
     const connect = () => {
       if (closedByCleanup) return;
@@ -675,8 +762,36 @@ export default function App() {
                 if (prev.some((p) => p.id === parsed.payload.id)) return prev;
                 return [parsed.payload, ...prev];
               });
+              setActivitySyncVersion((v) => v + 1);
             } else if (parsed.event === 'post:deleted' && parsed.payload?.id) {
               setPosts((prev) => prev.filter((p) => p.id !== parsed.payload.id));
+              setActivitySyncVersion((v) => v + 1);
+            } else if (parsed.event === 'post:updated' && parsed.payload?.id) {
+              setPosts((prev) =>
+                prev.map((p) =>
+                  p.id === parsed.payload.id
+                    ? {
+                        ...p,
+                        ...(typeof parsed.payload.likes_count === 'number'
+                          ? { likes_count: parsed.payload.likes_count }
+                          : {}),
+                        ...(typeof parsed.payload.comments_count === 'number'
+                          ? { comments_count: parsed.payload.comments_count }
+                          : {}),
+                      }
+                    : p
+                )
+              );
+              setActivitySyncVersion((v) => v + 1);
+            } else if (parsed.event === 'player:updated') {
+              if (parsed.payload?.player) {
+                patchAuthorAcrossFeed(parsed.payload.player);
+              } else {
+                loadFeedAndStories(true);
+              }
+              setActivitySyncVersion((v) => v + 1);
+            } else if (parsed.event === 'story:updated') {
+              loadFeedAndStories(true);
             }
           } catch {
             // ignore malformed ws message
@@ -706,14 +821,23 @@ export default function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [currentUser?.id, loadNotificationsAndChats, loadOwnerPanelState, showTransferToast]);
+  }, [currentUser?.id, currentUser?.is_guest, loadFeedAndStories, loadNotificationsAndChats, loadOwnerPanelState, showTransferToast]);
 
-  // Direct Supabase Realtime subscription (live broadcasts, giveaways, notifications, & balance without refresh)
+  // Direct Supabase Realtime subscription (live broadcasts, giveaways, posts, profiles, stories, likes, comments, chat across ALL devices)
   useEffect(() => {
-    if (!currentUser?.id || currentUser.is_guest || isStaticSpaHost()) return;
+    if (!currentUser?.id || isStaticSpaHost()) return;
     let cancelled = false;
     let activeChannel: any = null;
     let activeClient: any = null;
+    let feedDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleFeedSync = () => {
+      setActivitySyncVersion((v) => v + 1);
+      if (feedDebounceTimer) clearTimeout(feedDebounceTimer);
+      feedDebounceTimer = setTimeout(() => {
+        loadFeedAndStories(true);
+      }, 300);
+    };
 
     api
       .getRealtimeConfig()
@@ -748,53 +872,108 @@ export default function App() {
           )
           .on(
             'postgres_changes',
-            {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'notifications',
-              filter: `user_id=eq.${currentUser.id}`,
-            },
-            (payload: any) => {
-              const row = payload?.new;
-              if (row && !seenWsNotifIdsRef.current.has(row.id)) {
-                loadNotificationsAndChats();
-              }
+            { event: '*', schema: 'public', table: 'posts' },
+            () => {
+              scheduleFeedSync();
             }
           )
           .on(
             'postgres_changes',
-            {
-              event: 'UPDATE',
-              schema: 'public',
-              table: 'players',
-              filter: `id=eq.${currentUser.id}`,
-            },
-            (payload: any) => {
-              const row = payload?.new;
-              if (!row) return;
-              const nextCoins = Number(row.balance ?? row.coins);
-              if (Number.isFinite(nextCoins)) {
-                setCurrentUser((prev) =>
-                  prev && !prev.is_owner ? { ...prev, coins: nextCoins, balance: nextCoins } : prev
-                );
-              }
+            { event: '*', schema: 'public', table: 'stories' },
+            () => {
+              scheduleFeedSync();
             }
           )
-          .subscribe();
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'post_likes' },
+            () => {
+              scheduleFeedSync();
+            }
+          )
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'post_comments' },
+            () => {
+              scheduleFeedSync();
+            }
+          )
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'follows' },
+            () => {
+              setActivitySyncVersion((v) => v + 1);
+            }
+          )
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'players' },
+            (payload: any) => {
+              const row = payload?.new;
+              if (row && row.id === currentUser.id) {
+                const nextCoins = Number(row.balance ?? row.coins);
+                setCurrentUser((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        ...(row.border_id !== undefined ? { border_id: row.border_id } : {}),
+                        ...(!prev.is_owner && Number.isFinite(nextCoins)
+                          ? { coins: nextCoins, balance: nextCoins }
+                          : {}),
+                      }
+                    : prev
+                );
+              }
+              scheduleFeedSync();
+            }
+          );
 
+        if (!currentUser.is_guest) {
+          channel
+            .on(
+              'postgres_changes',
+              {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'notifications',
+                filter: `user_id=eq.${currentUser.id}`,
+              },
+              (payload: any) => {
+                const row = payload?.new;
+                if (row && !seenWsNotifIdsRef.current.has(row.id)) {
+                  loadNotificationsAndChats();
+                }
+              }
+            )
+            .on(
+              'postgres_changes',
+              { event: 'INSERT', schema: 'public', table: 'messages' },
+              (payload: any) => {
+                const row = payload?.new;
+                if (row && (row.receiver_id === currentUser.id || row.group_id)) {
+                  loadNotificationsAndChats();
+                  wsSeqRef.current += 1;
+                  setWsEvent({ event: 'message:new', payload: row, seq: wsSeqRef.current });
+                }
+              }
+            );
+        }
+
+        channel.subscribe();
         activeChannel = channel;
       })
       .catch(() => {
-        // WS + polling still keep data fresh if Realtime config is unavailable
+        // Polling still keeps data fresh if Realtime config is unavailable
       });
 
     return () => {
       cancelled = true;
+      if (feedDebounceTimer) clearTimeout(feedDebounceTimer);
       if (activeClient && activeChannel) {
         activeClient.removeChannel(activeChannel);
       }
     };
-  }, [currentUser?.id, loadNotificationsAndChats, loadOwnerPanelState]);
+  }, [currentUser?.id, currentUser?.is_guest, loadFeedAndStories, loadNotificationsAndChats, loadOwnerPanelState]);
 
   const handleOpenProfile = (username: string) => {
     if (currentUser && username.toLowerCase() === currentUser.username.toLowerCase()) {
@@ -1293,6 +1472,7 @@ export default function App() {
               onOpenComments={setCommentsPost}
               onOpenTransferCoin={openTransferModal}
               onRequireTelegram={requireTelegramToast}
+              syncVersion={activitySyncVersion}
             />
           ) : activeTab === 'feed' ? (
             <div className="pb-20">
@@ -1488,6 +1668,7 @@ export default function App() {
                 setOwnerPanelOpen(true);
               }}
               onRequireTelegram={requireTelegramToast}
+              syncVersion={activitySyncVersion}
             />
           )}
         </main>

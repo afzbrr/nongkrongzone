@@ -42,6 +42,7 @@ interface ProfileViewProps {
   onOpenTransferCoin?: (initialRecipient?: Player | null) => void;
   onOpenOwnerPanel?: () => void;
   onRequireTelegram?: () => void;
+  syncVersion?: number;
 }
 
 export const ProfileView: React.FC<ProfileViewProps> = ({
@@ -57,6 +58,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onOpenTransferCoin,
   onOpenOwnerPanel,
   onRequireTelegram,
+  syncVersion,
 }) => {
   const { bordersById } = useBorders();
   const { theme, setThemeId } = useTheme();
@@ -87,7 +89,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [sheetDragY, setSheetDragY] = useState(0);
   const dragStartYRef = useRef<number | null>(null);
 
-  const loadProfileData = async () => {
+  const loadProfileData = async (silent = false) => {
     const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
     if (currentUser.is_guest && isOwnByUsername) {
       setProfile(currentUser);
@@ -98,7 +100,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     if (isOwnByUsername && (!profile || profile.id !== currentUser.id)) {
       setProfile(currentUser);
       setLoading(false);
-    } else if (!profile) {
+    } else if (!profile && !silent) {
       setLoading(true);
     }
     try {
@@ -118,12 +120,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         setPosts([]);
       }
     } catch {
-      if (isOwnByUsername) {
-        setProfile(currentUser);
-      } else {
-        setProfile(null);
+      if (!silent) {
+        if (isOwnByUsername) {
+          setProfile(currentUser);
+        } else {
+          setProfile(null);
+        }
+        setPosts([]);
       }
-      setPosts([]);
     } finally {
       setLoading(false);
     }
@@ -134,8 +138,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   }, [username]);
 
   useEffect(() => {
-    loadProfileData();
+    loadProfileData(false);
   }, [username, currentUser.id, currentUser.username, currentUser.avatar_url, currentUser.name, currentUser.border_id]);
+
+  useEffect(() => {
+    if (!syncVersion) return;
+    loadProfileData(true);
+  }, [syncVersion]);
 
   useEffect(() => {
     setProfile((prev) =>

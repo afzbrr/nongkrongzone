@@ -84,6 +84,7 @@ async function apiFetch<T>(
     let res: Response;
     try {
       res = await fetch(url, {
+        ...(method === 'GET' ? { cache: 'no-store' as RequestCache } : {}),
         ...options,
         credentials: 'same-origin',
         headers,

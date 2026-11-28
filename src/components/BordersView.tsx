@@ -389,10 +389,10 @@ export const BordersView: React.FC<BordersViewProps> = ({
   const [toast, setToast] = useState<{ text: string; type: 'ok' | 'err' } | null>(null);
 
   useEffect(() => {
-    if (allBorders.length === 0 && !loading) {
+    if (allBorders.length === 0 && !loading && !error) {
       refreshBorders();
     }
-  }, [allBorders.length, loading, refreshBorders]);
+  }, [allBorders.length, loading, error, refreshBorders]);
 
   const showToast = useCallback((text: string, type: 'ok' | 'err' = 'ok') => {
     setToast({ text, type });
@@ -416,7 +416,8 @@ export const BordersView: React.FC<BordersViewProps> = ({
   };
 
   const filteredBorders = useMemo(() => {
-    const sourceList = activeTab === 'toko' ? allBorders : collectionBorders;
+    const sourceList =
+      activeTab === 'toko' || currentUser.is_owner ? allBorders : collectionBorders;
 
     return sourceList.filter((b) => {
       const upperName = String(b.name || '').trim().toUpperCase();
@@ -626,10 +627,18 @@ export const BordersView: React.FC<BordersViewProps> = ({
           </div>
         ) : error ? (
           <div
-            className="p-4 rounded-xl border border-[#FF453A]/40 text-[12.5px] text-[#FF453A]"
+            className="p-4 rounded-xl border border-[#FF453A]/40 text-[12.5px] text-[#FF453A] flex flex-col items-start gap-2.5"
             style={{ background: 'var(--nz-card)' }}
           >
-            {error}
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={() => refreshBorders()}
+              className="h-8 px-3.5 rounded-full text-[12px] font-semibold"
+              style={{ background: 'var(--nz-btn-bg)', color: 'var(--nz-btn-text)' }}
+            >
+              Coba Lagi
+            </button>
           </div>
         ) : filteredBorders.length === 0 ? (
           <div className="py-12 px-4 text-center flex flex-col items-center gap-2">
