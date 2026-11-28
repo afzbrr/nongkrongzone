@@ -86,21 +86,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [profileContentTab, setProfileContentTab] = useState<'posts' | 'reposts'>('posts');
   const [sheetDragY, setSheetDragY] = useState(0);
   const dragStartYRef = useRef<number | null>(null);
-  const [tgDebug, setTgDebug] = useState<{
-    platform: string;
-    hasInitData: boolean;
-    user: unknown;
-    url: string;
-    userAgent: string;
-    tickLabel: string;
-  }>({
-    platform: '-',
-    hasInitData: false,
-    user: null,
-    url: '',
-    userAgent: '',
-    tickLabel: '0s',
-  });
 
   const loadProfileData = async () => {
     const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
@@ -110,7 +95,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       setLoading(false);
       return;
     }
-    if (isOwnByUsername && !profile) {
+    if (isOwnByUsername && (!profile || profile.id !== currentUser.id)) {
       setProfile(currentUser);
       setLoading(false);
     } else if (!profile) {
@@ -160,46 +145,34 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     );
   }, [currentUser.id, currentUser.coins, currentUser.is_owner]);
 
-  useEffect(() => {
-    const readSnapshot = (tickLabel: string) => {
-      try {
-        const win = typeof window !== 'undefined' ? (window as any) : null;
-        const tgWebApp = win?.Telegram?.WebApp;
-        const rawInitData = typeof tgWebApp?.initData === 'string' ? tgWebApp.initData : '';
-        const rawUser = tgWebApp?.initDataUnsafe?.user ?? null;
-        setTgDebug({
-          platform: String(tgWebApp?.platform ?? 'tidak ada'),
-          hasInitData: Boolean(rawInitData && rawInitData.trim().length > 0),
-          user: rawUser && Object.keys(rawUser).length > 0 ? rawUser : null,
-          url: typeof window !== 'undefined' ? window.location.href : '',
-          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
-          tickLabel,
-        });
-      } catch {
-        // Ignore Telegram debug read error
+  const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
+  const isMe = Boolean(isOwnByUsername || (profile && profile.id === currentUser.id));
+  const displayProfile: Player | null = isOwnByUsername
+    ? {
+        ...(profile && profile.id === currentUser.id ? profile : currentUser),
+        ...currentUser,
+        followers_count:
+          profile && profile.id === currentUser.id
+            ? (profile.followers_count ?? currentUser.followers_count ?? 0)
+            : (currentUser.followers_count ?? 0),
+        following_count:
+          profile && profile.id === currentUser.id
+            ? (profile.following_count ?? currentUser.following_count ?? 0)
+            : (currentUser.following_count ?? 0),
+        posts_count:
+          profile && profile.id === currentUser.id
+            ? (profile.posts_count ?? currentUser.posts_count ?? 0)
+            : (currentUser.posts_count ?? 0),
       }
-    };
-
-    readSnapshot('0s');
-    const t1 = setTimeout(() => readSnapshot('1s'), 1000);
-    const t2 = setTimeout(() => readSnapshot('2s'), 2000);
-    const t3 = setTimeout(() => readSnapshot('3s'), 3000);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      clearTimeout(t3);
-    };
-  }, []);
-
-  const isMe = profile?.id === currentUser.id;
+    : profile;
 
   const handleFollow = async () => {
     if (currentUser.is_guest) {
       onRequireTelegram?.();
       return;
     }
-    if (!profile) return;
-    await api.follow(profile.id);
+    if (!displayProfile) return;
+    await api.follow(displayProfile.id);
     setProfile((prev) =>
       prev
         ? {
@@ -216,10 +189,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       onRequireTelegram?.();
       return;
     }
-    if (!profile) return;
-    const res = await api.unfollow(profile.id);
+    if (!displayProfile) return;
+    const res = await api.unfollow(displayProfile.id);
     setUnfollowConfirmOpen(false);
-    if (!currentUser.is_owner && (res.follows_owner === false || profile.is_owner || profile.telegram_id === 6189849073)) {
+    if (!currentUser.is_owner && (res.follows_owner === false || displayProfile.is_owner || displayProfile.telegram_id === 6189849073)) {
       onOwnerUnfollowed?.();
       return;
     }
@@ -239,13 +212,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       onRequireTelegram?.();
       return;
     }
-    if (!profile) return;
-    if (profile.is_blocked_by_me) {
-      await api.unblock(profile.id);
+    if (!displayProfile) return;
+    if (displayProfile.is_blocked_by_me) {
+      await api.unblock(displayProfile.id);
       await loadProfileData();
     } else {
-      const res = await api.block(profile.id);
-      if (!currentUser.is_owner && (res.follows_owner === false || profile.is_owner || profile.telegram_id === 6189849073)) {
+      const res = await api.block(displayProfile.id);
+      if (!currentUser.is_owner && (res.follows_owner === false || displayProfile.is_owner || displayProfile.telegram_id === 6189849073)) {
         onOwnerUnfollowed?.();
         return;
       }
@@ -254,14 +227,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const openFollowSheet = async (mode: 'followers' | 'following') => {
-    if (!profile) return;
+    if (!displayProfile) return;
     setFollowSheetMode(mode);
     setLoadingFollowList(true);
     try {
       const res =
         mode === 'followers'
-          ? await api.getFollowers(profile.id)
-          : await api.getFollowing(profile.id);
+          ? await api.getFollowers(displayProfile.id)
+          : await api.getFollowing(displayProfile.id);
       setFollowList(res.players);
     } finally {
       setLoadingFollowList(false);
@@ -341,7 +314,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         }
       }
       setEditAvatar(nextUrl);
-      if (applyImmediately && profile) {
+      if (applyImmediately && displayProfile) {
         if (currentUser.is_guest) {
           const updatedGuest: Player = {
             ...currentUser,
@@ -358,7 +331,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
           const res = await api.updateMe({ avatar_url: nextUrl || null });
           const updatedPlayer: Player = {
             ...res.player,
-            has_telegram_username: res.player.has_telegram_username ?? profile.has_telegram_username,
+            has_telegram_username: res.player.has_telegram_username ?? displayProfile.has_telegram_username,
           };
           persistProfileEditsLocally({
             player: updatedPlayer,
@@ -397,8 +370,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         name: cleanedName,
         avatar_url: editAvatar || null,
         bio: updatedGuest.bio || '',
-        markNameEdited: true,
-        markAvatarEdited: (editAvatar || null) !== (profile?.avatar_url || null),
+        markNameEdited: cleanedName !== (displayProfile?.name || ''),
+        markAvatarEdited: (editAvatar || null) !== (displayProfile?.avatar_url || null),
       });
       setProfile(updatedGuest);
       onCurrentUserUpdated(updatedGuest);
@@ -406,7 +379,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       return;
     }
 
-    const canEditUsername = profile?.has_telegram_username === false;
+    const canEditUsername = displayProfile?.has_telegram_username === false;
     let cleanedUsername: string | undefined;
     if (canEditUsername) {
       cleanedUsername = editUsername
@@ -432,7 +405,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       });
       const updatedPlayer: Player = {
         ...res.player,
-        has_telegram_username: res.player.has_telegram_username ?? profile?.has_telegram_username,
+        has_telegram_username: res.player.has_telegram_username ?? displayProfile?.has_telegram_username,
       };
       persistProfileEditsLocally({
         player: updatedPlayer,
@@ -440,10 +413,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         avatar_url: updatedPlayer.avatar_url,
         username: updatedPlayer.username,
         bio: updatedPlayer.bio || '',
-        markNameEdited: true,
+        markNameEdited: cleanedName !== (displayProfile?.name || ''),
         markAvatarEdited:
-          (editAvatar || null) !== (profile?.telegram_avatar_url || null) ||
-          (editAvatar || null) !== (profile?.avatar_url || null),
+          (editAvatar || null) !== (displayProfile?.telegram_avatar_url || null) &&
+          (editAvatar || null) !== (displayProfile?.avatar_url || null),
       });
       setProfile(updatedPlayer);
       onCurrentUserUpdated(updatedPlayer);
@@ -455,7 +428,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     }
   };
 
-  if (loading) {
+  if (loading && !displayProfile) {
     return (
       <div className="py-16 text-center text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
         Memuat profil...
@@ -463,7 +436,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     );
   }
 
-  if (!profile) {
+  if (!displayProfile) {
     return (
       <div className="py-16 text-center px-6">
         <p className="text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
@@ -473,9 +446,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     );
   }
 
-  const equippedBorderLabel = profile.border_id
-    ? bordersById.get(String(profile.border_id))?.name || profile.border_id
-    : profile.is_owner
+  const equippedBorderLabel = displayProfile.border_id
+    ? bordersById.get(String(displayProfile.border_id))?.name || displayProfile.border_id
+    : displayProfile.is_owner
       ? 'FAIZ GANTENG'
       : null;
 
@@ -500,7 +473,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             className="font-display text-[15px] font-bold truncate"
             style={{ color: 'var(--nz-text)' }}
           >
-            @{profile.username}
+            @{displayProfile.username}
           </span>
         </div>
       )}
@@ -542,7 +515,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       {/* Profile Header */}
       <div className="px-4 pt-5 pb-4 border-b" style={{ borderColor: 'var(--nz-border)' }}>
         <div className="flex items-start justify-between gap-4">
-          <Avatar player={profile} size={72} />
+          <Avatar player={displayProfile} size={72} />
 
           <div className="flex-1 grid grid-cols-3 gap-2 pt-2 text-center">
             <div>
@@ -550,7 +523,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 className="font-display text-[15px] font-bold tabular-nums"
                 style={{ color: 'var(--nz-text)' }}
               >
-                {formatNumber(profile.posts_count ?? posts.length)}
+                {formatNumber(displayProfile.posts_count ?? posts.length)}
               </div>
               <div className="text-[11px]" style={{ color: 'var(--nz-text-muted)' }}>
                 Postingan
@@ -565,7 +538,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 className="font-display text-[15px] font-bold tabular-nums"
                 style={{ color: 'var(--nz-text)' }}
               >
-                {formatNumber(profile.followers_count || 0)}
+                {formatNumber(displayProfile.followers_count || 0)}
               </div>
               <div className="text-[11px]" style={{ color: 'var(--nz-text-muted)' }}>
                 Pengikut
@@ -580,7 +553,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 className="font-display text-[15px] font-bold tabular-nums"
                 style={{ color: 'var(--nz-text)' }}
               >
-                {formatNumber(profile.following_count || 0)}
+                {formatNumber(displayProfile.following_count || 0)}
               </div>
               <div className="text-[11px]" style={{ color: 'var(--nz-text-muted)' }}>
                 Mengikuti
@@ -596,9 +569,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               className="font-display text-[17px] font-bold tracking-[-0.5px]"
               style={{ color: 'var(--nz-text)' }}
             >
-              {profile.name}
+              {displayProfile.name}
             </h1>
-            {profile.is_owner && <OwnerBadge />}
+            {displayProfile.is_owner && <OwnerBadge />}
             {equippedBorderLabel && (
               <span
                 className="text-[10px] font-semibold uppercase tracking-wider border px-2 py-0.5 rounded-[4px]"
@@ -613,18 +586,18 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             className="flex items-center gap-2.5 mt-0.5 text-[12.5px] flex-wrap"
             style={{ color: 'var(--nz-text-muted)' }}
           >
-            <span>{profile.is_guest || profile.username === '-' ? '-' : `@${profile.username}`}</span>
+            <span>{displayProfile.is_guest || displayProfile.username === '-' ? '-' : `@${displayProfile.username}`}</span>
             <span aria-hidden="true">·</span>
             <CoinDisplay
-              coins={profile.balance ?? profile.coins}
+              coins={displayProfile.balance ?? displayProfile.coins}
               isOwner={Boolean(
-                profile.is_owner ||
-                  profile.role === 'owner' ||
-                  profile.telegram_id === 6189849073 ||
-                  String(profile.username || '').toLowerCase() === 'afz'
+                displayProfile.is_owner ||
+                  displayProfile.role === 'owner' ||
+                  displayProfile.telegram_id === 6189849073 ||
+                  String(displayProfile.username || '').toLowerCase() === 'afz'
               )}
             />
-            {isMe && !profile.is_guest && onOpenTransferCoin && (
+            {isMe && !displayProfile.is_guest && onOpenTransferCoin && (
               <button
                 type="button"
                 onClick={() => onOpenTransferCoin(null)}
@@ -637,12 +610,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             )}
           </div>
 
-          {profile.bio && (
+          {displayProfile.bio && (
             <p
               className="mt-2 text-[13.5px] leading-[1.5] whitespace-pre-wrap"
               style={{ color: 'var(--nz-text-body)' }}
             >
-              {profile.bio}
+              {displayProfile.bio}
             </p>
           )}
         </div>
@@ -654,10 +627,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  setEditName((profile.full_name || profile.name || '').slice(0, 20));
-                  setEditUsername(profile.username || '');
-                  setEditBio(profile.bio || '');
-                  setEditAvatar(profile.avatar_url || '');
+                  setEditName((displayProfile.full_name || displayProfile.name || '').slice(0, 20));
+                  setEditUsername(displayProfile.username || '');
+                  setEditBio(displayProfile.bio || '');
+                  setEditAvatar(displayProfile.avatar_url || '');
                   setEditNotice(null);
                   setEditOpen(true);
                 }}
@@ -696,7 +669,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 />
               </label>
 
-              {!profile.is_guest && onOpenBorders && (
+              {!displayProfile.is_guest && onOpenBorders && (
                 <button
                   type="button"
                   onClick={onOpenBorders}
@@ -708,7 +681,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 </button>
               )}
 
-              {!profile.is_guest && onOpenTransferCoin && (
+              {!displayProfile.is_guest && onOpenTransferCoin && (
                 <button
                   type="button"
                   onClick={() => onOpenTransferCoin(null)}
@@ -724,13 +697,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 </button>
               )}
 
-              {!profile.is_guest &&
+              {!displayProfile.is_guest &&
                 onOpenOwnerPanel &&
                 Boolean(
-                  profile.is_owner ||
-                    profile.role === 'owner' ||
-                    profile.telegram_id === 6189849073 ||
-                    String(profile.username || '').toLowerCase() === 'afz'
+                  displayProfile.is_owner ||
+                    displayProfile.role === 'owner' ||
+                    displayProfile.telegram_id === 6189849073 ||
+                    String(displayProfile.username || '').toLowerCase() === 'afz'
                 ) && (
                   <button
                     type="button"
@@ -742,7 +715,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   </button>
                 )}
 
-              {!profile.is_guest && (
+              {!displayProfile.is_guest && (
                 <button
                   type="button"
                   onClick={async () => {
@@ -764,9 +737,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             </>
           ) : (
             <>
-              {!profile.is_blocked_by_me && !profile.has_blocked_me && (
+              {!displayProfile.is_blocked_by_me && !displayProfile.has_blocked_me && (
                 <>
-                  {profile.is_following ? (
+                  {displayProfile.is_following ? (
                     <button
                       type="button"
                       onClick={() => setUnfollowConfirmOpen(true)}
@@ -797,7 +770,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                         onRequireTelegram?.();
                         return;
                       }
-                      onOpenChatWith(profile);
+                      onOpenChatWith(displayProfile);
                     }}
                     className="h-[28px] px-[14px] rounded-full border text-[12px] font-semibold flex items-center gap-1.5"
                     style={{
@@ -813,7 +786,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   {onOpenTransferCoin && (
                     <button
                       type="button"
-                      onClick={() => onOpenTransferCoin(profile)}
+                      onClick={() => onOpenTransferCoin(displayProfile)}
                       className="h-[28px] px-[14px] rounded-full text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
                       style={{
                         background: 'var(--nz-btn-bg)',
@@ -833,66 +806,15 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 className="h-[28px] px-[12px] rounded-full bg-transparent text-[#FF453A] text-[12px] font-semibold flex items-center gap-1 hover:bg-[#FF453A]/10"
               >
                 <Ban className="w-3.5 h-3.5" strokeWidth={1.5} />
-                <span>{profile.is_blocked_by_me ? 'Buka Blokir' : 'Blokir'}</span>
+                <span>{displayProfile.is_blocked_by_me ? 'Buka Blokir' : 'Blokir'}</span>
               </button>
             </>
           )}
         </div>
-
-        {/* Temporary Debug Telegram Box (only on own profile) */}
-        {isMe && (
-          <div
-            className="mt-3 rounded-[10px] border p-2.5 text-[11px] leading-[1.45] font-mono break-all"
-            style={{
-              background: 'var(--nz-elevated)',
-              borderColor: 'var(--nz-border)',
-              color: 'var(--nz-text)',
-            }}
-          >
-            <div className="flex items-center justify-between gap-2 mb-1.5">
-              <span className="font-sans text-[11px] font-bold tracking-wide uppercase" style={{ color: 'var(--nz-accent-text)' }}>
-                DEBUG TELEGRAM
-              </span>
-              <span className="text-[10px]" style={{ color: 'var(--nz-text-muted)' }}>
-                update: {tgDebug.tickLabel}
-              </span>
-            </div>
-            <div className="space-y-1">
-              <div>
-                <span style={{ color: 'var(--nz-text-muted)' }}>platform: </span>
-                <span>{tgDebug.platform}</span>
-              </div>
-              <div>
-                <span style={{ color: 'var(--nz-text-muted)' }}>initData: </span>
-                <span>{tgDebug.hasInitData ? 'ada' : 'tidak ada'}</span>
-              </div>
-              <div>
-                <span style={{ color: 'var(--nz-text-muted)' }}>user: </span>
-                {tgDebug.user ? (
-                  <pre className="mt-1 p-1.5 rounded bg-black/40 text-[10.5px] whitespace-pre-wrap break-all overflow-x-auto">
-                    {JSON.stringify(tgDebug.user, null, 2)}
-                  </pre>
-                ) : (
-                  <span className="font-sans font-bold text-[#FF453A]">
-                    USER KOSONG - Telegram tidak mengirim data
-                  </span>
-                )}
-              </div>
-              <div>
-                <span style={{ color: 'var(--nz-text-muted)' }}>URL: </span>
-                <span>{tgDebug.url}</span>
-              </div>
-              <div>
-                <span style={{ color: 'var(--nz-text-muted)' }}>userAgent: </span>
-                <span>{tgDebug.userAgent}</span>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Tabs: Postingan & Repost */}
-      {!profile.is_blocked_by_me && !profile.has_blocked_me && (
+      {!displayProfile.is_blocked_by_me && !displayProfile.has_blocked_me && (
         <div className="grid grid-cols-2 border-b" style={{ borderColor: 'var(--nz-border)' }}>
           <button
             type="button"
@@ -945,7 +867,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             ? posts.filter((p) => Boolean(p.original_post_id))
             : posts.filter((p) => !p.original_post_id);
 
-        if (profile.is_blocked_by_me || profile.has_blocked_me) {
+        if (displayProfile.is_blocked_by_me || displayProfile.has_blocked_me) {
           return (
             <div className="py-16 text-center px-6 text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
               Postingan disembunyikan karena pengguna ini diblokir.
@@ -1004,7 +926,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             style={{ background: 'var(--nz-modal-bg)', borderColor: 'var(--nz-border)' }}
           >
             <h3 className="font-display text-[15px] font-bold" style={{ color: 'var(--nz-text)' }}>
-              Berhenti Mengikuti @{profile.username}?
+              Berhenti Mengikuti @{displayProfile.username}?
             </h3>
             <p className="text-[13px]" style={{ color: 'var(--nz-text-muted)' }}>
               Kamu bisa mengikuti kembali kapan saja.
@@ -1143,7 +1065,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     />
                   ) : (
                     <span className="font-display text-base font-bold text-[#F4F4F5]">
-                      {getInitials(editName || profile.name)}
+                      {getInitials(editName || displayProfile.name)}
                     </span>
                   )}
                 </div>
@@ -1173,11 +1095,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     />
                   </label>
 
-                  {!profile.is_guest && (
+                  {!displayProfile.is_guest && (
                     <button
                       type="button"
                       onClick={() => {
-                        const tgPhoto = profile.telegram_avatar_url || '';
+                        const tgPhoto = displayProfile.telegram_avatar_url || '';
                         setEditAvatar(tgPhoto);
                         setEditNotice(
                           tgPhoto
@@ -1223,7 +1145,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             </label>
 
             {/* Username: editable jika Telegram tidak punya username, terkunci jika punya username Telegram atau mode Guest */}
-            {!profile.is_guest && profile.has_telegram_username === false ? (
+            {!displayProfile.is_guest && displayProfile.has_telegram_username === false ? (
               <label className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
                 <div className="flex items-center justify-between">
                   <span>Username (Bisa Diubah)</span>
@@ -1264,7 +1186,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 <div className="relative flex items-center">
                   <input
                     type="text"
-                    value={profile.is_guest || profile.username === '-' ? '-' : `@${profile.username}`}
+                    value={displayProfile.is_guest || displayProfile.username === '-' ? '-' : `@${displayProfile.username}`}
                     disabled
                     readOnly
                     aria-label="Username Telegram (tidak dapat diubah)"

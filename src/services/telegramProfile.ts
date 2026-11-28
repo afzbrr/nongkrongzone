@@ -18,6 +18,7 @@ export interface NongkrongLocalProfile {
   telegram_avatar_url: string | null;
   bio: string;
   has_telegram_username: boolean;
+  isEdited: boolean;
   custom_name_edited: boolean;
   custom_avatar_edited: boolean;
   is_guest: boolean;
@@ -195,6 +196,8 @@ export function loadLocalNongkrongProfile(): NongkrongLocalProfile | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return null;
+    const customNameEdited = Boolean(parsed.custom_name_edited);
+    const customAvatarEdited = Boolean(parsed.custom_avatar_edited);
     return {
       telegram_id:
         typeof parsed.telegram_id === 'number' && Number.isFinite(parsed.telegram_id)
@@ -209,8 +212,9 @@ export function loadLocalNongkrongProfile(): NongkrongLocalProfile | null {
           : null,
       bio: typeof parsed.bio === 'string' ? parsed.bio : '',
       has_telegram_username: Boolean(parsed.has_telegram_username),
-      custom_name_edited: Boolean(parsed.custom_name_edited),
-      custom_avatar_edited: Boolean(parsed.custom_avatar_edited),
+      isEdited: Boolean(parsed.isEdited || customNameEdited || customAvatarEdited),
+      custom_name_edited: customNameEdited,
+      custom_avatar_edited: customAvatarEdited,
       is_guest: Boolean(parsed.is_guest),
       updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : new Date().toISOString(),
     };
@@ -238,12 +242,11 @@ export function getTelegramDisplayName(tgUser?: ClientTelegramUser | null): stri
 }
 
 /**
- * Syncs client-side Telegram profile with `localStorage.nongkrong_profile`
- * following the exact rules:
- * - Never overwrites Telegram profile with Guest localStorage profile.
- * - First open (or if user hasn't edited Name/Photo): uses Telegram Name (first_name + last_name) & Photo (photo_url).
- * - Subsequent opens: preserves user-edited Name / Photo,
- *   while ALWAYS updating Username to the latest Telegram username (when Telegram provides one).
+ * Syncs client-side Telegram profile with `localStorage.nongkrong_profile`:
+ * - If localStorage has Guest, no telegram_id, or different telegram_id -> ALWAYS overwrite with Telegram data.
+ * - If user explicitly edited Name/Photo AFTER Telegram was saved (isEdited = true) -> keep edited Name/Photo.
+ * - Otherwise -> ALWAYS use Telegram Name (first_name + last_name) & Photo (photo_url).
+ * - Username ALWAYS comes from Telegram when available.
  */
 export function syncTelegramUserWithLocalProfile(
   tgUser: ClientTelegramUser,
@@ -267,7 +270,22 @@ export function syncTelegramUserWithLocalProfile(
     typeof tgUser.photo_url === 'string' && tgUser.photo_url.trim() ? tgUser.photo_url.trim() : null;
 
   const stored = loadLocalNongkrongProfile();
-  const isSameStoredUser = Boolean(stored && !stored.is_guest && stored.telegram_id === tgId);
+  const storedIsInvalidOrGuest = Boolean(
+    !stored ||
+      stored.is_guest ||
+      !stored.telegram_id ||
+      stored.telegram_id !== tgId ||
+      stored.name.trim() === '' ||
+      stored.name.trim().toLowerCase() === 'guest'
+  );
+  const isSameStoredTgUser = !storedIsInvalidOrGuest;
+
+  const customNameEdited = Boolean(
+    isSameStoredTgUser && stored?.isEdited && stored?.custom_name_edited && stored.name.trim()
+  );
+  const customAvatarEdited = Boolean(
+    isSameStoredTgUser && stored?.isEdited && stored?.custom_avatar_edited
+  );
 
   const serverName =
     serverPlayer && typeof serverPlayer.name === 'string' && serverPlayer.name.trim()
@@ -278,48 +296,23 @@ export function syncTelegramUserWithLocalProfile(
       ? serverPlayer.avatar_url.trim()
       : null;
 
-  const customNameEdited = Boolean(
-    (isSameStoredUser && stored?.custom_name_edited) ||
-      (serverName &&
-        tgName &&
-        serverName !== tgName &&
-        !/^tg_\d+$/.test(serverName) &&
-        serverName !== 'Pengguna' &&
-        serverName !== 'Guest')
-  );
-  const customAvatarEdited = Boolean(
-    (isSameStoredUser && stored?.custom_avatar_edited) ||
-      (serverAvatar &&
-        tgPhotoUrl &&
-        serverAvatar !== tgPhotoUrl &&
-        !serverAvatar.includes(`tg_avatar_${tgId}`))
-  );
+  const resolvedName = customNameEdited && stored?.name.trim()
+    ? stored.name.trim().slice(0, 20)
+    : tgName || serverName;
 
-  const resolvedName =
-    isSameStoredUser && stored?.custom_name_edited && stored.name.trim()
-      ? stored.name.trim().slice(0, 20)
-      : customNameEdited && serverName
-        ? serverName
-        : tgName || serverName;
-
-  const resolvedAvatarUrl =
-    isSameStoredUser && stored?.custom_avatar_edited
-      ? stored.avatar_url
-      : customAvatarEdited && serverAvatar
-        ? serverAvatar
-        : tgPhotoUrl ?? serverAvatar;
+  const resolvedAvatarUrl = customAvatarEdited
+    ? stored?.avatar_url ?? null
+    : tgPhotoUrl ?? serverAvatar;
 
   const resolvedUsername = hasTelegramUsername
     ? rawTgUsername
-    : serverPlayer?.username || (isSameStoredUser ? stored?.username : '') || `tg_${tgId}`;
+    : serverPlayer?.username || (isSameStoredTgUser ? stored?.username : '') || `tg_${tgId}`;
 
   const needsServerSync = Boolean(
     serverPlayer &&
       ((resolvedName && resolvedName !== serverPlayer.name) ||
         (resolvedAvatarUrl && resolvedAvatarUrl !== (serverPlayer.avatar_url || null)) ||
-        (isSameStoredUser &&
-          stored?.custom_avatar_edited &&
-          stored.avatar_url !== (serverPlayer.avatar_url || null)))
+        (customAvatarEdited && stored?.avatar_url !== (serverPlayer.avatar_url || null)))
   );
 
   const nextLocal: NongkrongLocalProfile = {
@@ -327,9 +320,10 @@ export function syncTelegramUserWithLocalProfile(
     name: resolvedName,
     username: resolvedUsername,
     avatar_url: resolvedAvatarUrl,
-    telegram_avatar_url: tgPhotoUrl || (isSameStoredUser ? stored?.telegram_avatar_url || null : null),
-    bio: serverPlayer?.bio ?? (isSameStoredUser ? stored?.bio || '' : ''),
+    telegram_avatar_url: tgPhotoUrl || (isSameStoredTgUser ? stored?.telegram_avatar_url || null : null),
+    bio: serverPlayer?.bio ?? (isSameStoredTgUser ? stored?.bio || '' : ''),
     has_telegram_username: hasTelegramUsername,
+    isEdited: Boolean(customNameEdited || customAvatarEdited),
     custom_name_edited: customNameEdited,
     custom_avatar_edited: customAvatarEdited,
     is_guest: false,
@@ -348,6 +342,34 @@ export function syncTelegramUserWithLocalProfile(
   };
 }
 
+export function buildTelegramPlayerFromClient(tgUser: ClientTelegramUser): Player {
+  const synced = syncTelegramUserWithLocalProfile(tgUser);
+  const isOwner = Number(tgUser.id) === 6189849073;
+  return {
+    id: isOwner ? 'owner-tg-6189849073' : `tg_${tgUser.id}`,
+    telegram_id: Number(tgUser.id),
+    name: synced.resolvedName,
+    full_name: synced.resolvedName,
+    username: synced.resolvedUsername,
+    avatar_url: synced.resolvedAvatarUrl,
+    telegram_avatar_url: synced.localProfile.telegram_avatar_url,
+    bio: synced.localProfile.bio || '',
+    coins: isOwner ? 999999999 : 500,
+    balance: isOwner ? 999999999 : 500,
+    role: isOwner ? 'owner' : 'user',
+    is_owner: isOwner,
+    is_banned: false,
+    border_id: isOwner ? 'FAIZ_SPIDERMAN' : null,
+    created_at: new Date().toISOString(),
+    followers_count: 0,
+    following_count: 0,
+    posts_count: 0,
+    has_telegram_username: synced.hasTelegramUsername,
+    follows_owner: isOwner,
+    is_guest: false,
+  };
+}
+
 export function buildGuestPlayerFromLocal(): Player {
   const stored = loadLocalNongkrongProfile();
   const isGuestStored = Boolean(stored && stored.is_guest);
@@ -363,6 +385,7 @@ export function buildGuestPlayerFromLocal(): Player {
     telegram_avatar_url: null,
     bio,
     has_telegram_username: true,
+    isEdited: Boolean(isGuestStored && stored?.isEdited),
     custom_name_edited: Boolean(isGuestStored && stored?.custom_name_edited),
     custom_avatar_edited: Boolean(isGuestStored && stored?.custom_avatar_edited),
     is_guest: true,
@@ -412,6 +435,10 @@ export function persistProfileEditsLocally(params: {
   );
   const isSameGuest = Boolean(stored && stored.is_guest && params.player.is_guest);
   const carryFlags = isSameTg || isSameGuest;
+  const customNameEdited = Boolean(params.markNameEdited || (carryFlags && stored?.custom_name_edited));
+  const customAvatarEdited = Boolean(
+    params.markAvatarEdited || (carryFlags && stored?.custom_avatar_edited)
+  );
 
   saveLocalNongkrongProfile({
     telegram_id: params.player.is_guest ? null : params.player.telegram_id ?? null,
@@ -424,10 +451,9 @@ export function persistProfileEditsLocally(params: {
     has_telegram_username: params.player.is_guest
       ? true
       : params.player.has_telegram_username !== false,
-    custom_name_edited: Boolean(params.markNameEdited || (carryFlags && stored?.custom_name_edited)),
-    custom_avatar_edited: Boolean(
-      params.markAvatarEdited || (carryFlags && stored?.custom_avatar_edited)
-    ),
+    isEdited: Boolean(customNameEdited || customAvatarEdited || (carryFlags && stored?.isEdited)),
+    custom_name_edited: customNameEdited,
+    custom_avatar_edited: customAvatarEdited,
     is_guest: Boolean(params.player.is_guest),
     updated_at: new Date().toISOString(),
   });

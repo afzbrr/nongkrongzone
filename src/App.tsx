@@ -34,6 +34,7 @@ import {
 } from './services/api';
 import {
   buildGuestPlayerFromLocal,
+  buildTelegramPlayerFromClient,
   initTelegramWebAppSafe,
   persistProfileEditsLocally,
   readTelegramClientAuthSafe,
@@ -327,6 +328,15 @@ export default function App() {
         setNoOwnerFallback(!allowOwnerPreview);
 
         const { initData, tgUser } = auth;
+        const immediateTgPlayer = tgUser?.id ? buildTelegramPlayerFromClient(tgUser) : null;
+        if (immediateTgPlayer) {
+          setGuestMode(false);
+          setCurrentUser(immediateTgPlayer);
+          if (immediateTgPlayer.is_owner) {
+            setBootState('ready');
+          }
+        }
+
         let meRes: {
           player: Player;
           sessionToken?: string;
@@ -352,17 +362,30 @@ export default function App() {
               : {}),
           };
           try {
-            meRes = await api.telegramLogin(payload);
-          } catch (postErr: any) {
-            if (
-              postErr?.code === 'SUPABASE_NOT_CONFIGURED' ||
-              postErr?.status === 401 ||
-              postErr?.status === 400 ||
-              postErr?.isSpaFallbackHtml
-            ) {
-              throw postErr;
+            try {
+              meRes = await api.telegramLogin(payload);
+            } catch (postErr: any) {
+              if (
+                postErr?.code === 'SUPABASE_NOT_CONFIGURED' ||
+                postErr?.status === 401 ||
+                postErr?.status === 400 ||
+                postErr?.isSpaFallbackHtml
+              ) {
+                throw postErr;
+              }
+              meRes = await api.telegramLoginGet(payload);
             }
-            meRes = await api.telegramLoginGet(payload);
+          } catch (loginErr: any) {
+            if (immediateTgPlayer && loginErr?.code !== 'SUPABASE_NOT_CONFIGURED') {
+              resolvedByServerRef.current = true;
+              setGuestMode(false);
+              setCurrentUser(immediateTgPlayer);
+              setAllPlayers((prev) => (prev.length > 0 ? prev : [immediateTgPlayer]));
+              setBootState('ready');
+              loadFeedAndStories().catch(() => {});
+              return;
+            }
+            throw loginErr;
           }
         } else if (allowOwnerPreview) {
           meRes = await api.getMe();
@@ -395,6 +418,7 @@ export default function App() {
             avatar_url: synced.resolvedAvatarUrl,
             username: synced.resolvedUsername,
             has_telegram_username: synced.hasTelegramUsername,
+            is_guest: false,
           };
           if (synced.needsServerSync) {
             api
@@ -421,6 +445,18 @@ export default function App() {
       } catch (err: any) {
         const latestAuth = extractTelegramAuth(false);
         const insideTg = Boolean(latestAuth.isTelegramEnv || isTelegramMiniAppRef.current);
+        if (latestAuth.tgUser?.id && err?.code !== 'SUPABASE_NOT_CONFIGURED') {
+          const fallbackTgPlayer = buildTelegramPlayerFromClient(latestAuth.tgUser);
+          resolvedByServerRef.current = true;
+          setGuestMode(false);
+          setIsTelegramMiniApp(true);
+          isTelegramMiniAppRef.current = true;
+          setCurrentUser(fallbackTgPlayer);
+          setAllPlayers((prev) => (prev.length > 0 ? prev : [fallbackTgPlayer]));
+          setBootState('ready');
+          loadFeedAndStories().catch(() => {});
+          return;
+        }
         if (err?.code === 'SUPABASE_NOT_CONFIGURED') {
           resolvedByServerRef.current = true;
           setMissingEnv(['SUPABASE_URL', 'SUPABASE_ANON_KEY']);
@@ -496,23 +532,38 @@ export default function App() {
     bootstrap(false);
   }, [bootstrap]);
 
-  // If still Guest after 2s, keep watching briefly in case Telegram WebApp injects user late
+  // If still Guest, immediately check Telegram WebApp & promote if tgUser is available
   useEffect(() => {
     if (!currentUser?.is_guest) return;
+    const immediateCheck = extractTelegramAuth(false);
+    if (immediateCheck.tgUser?.id) {
+      setIsTelegramMiniApp(true);
+      isTelegramMiniAppRef.current = true;
+      setGuestMode(false);
+      setCurrentUser(buildTelegramPlayerFromClient(immediateCheck.tgUser));
+      bootstrap(true);
+      return;
+    }
+
     let checks = 0;
     const timer = setInterval(() => {
       checks += 1;
       const lateAuth = extractTelegramAuth(false);
       if (lateAuth.isTelegramEnv && !isTelegramMiniApp) {
+        isTelegramMiniAppRef.current = true;
         setIsTelegramMiniApp(true);
       }
       if (lateAuth.tgUser?.id || lateAuth.initData) {
         clearInterval(timer);
+        if (lateAuth.tgUser?.id) {
+          setGuestMode(false);
+          setCurrentUser(buildTelegramPlayerFromClient(lateAuth.tgUser));
+        }
         bootstrap(true);
-      } else if (checks >= 16) {
+      } else if (checks >= 20) {
         clearInterval(timer);
       }
-    }, 600);
+    }, 500);
     return () => clearInterval(timer);
   }, [bootstrap, currentUser?.is_guest, extractTelegramAuth, isTelegramMiniApp]);
 
