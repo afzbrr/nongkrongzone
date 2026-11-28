@@ -86,6 +86,21 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const [profileContentTab, setProfileContentTab] = useState<'posts' | 'reposts'>('posts');
   const [sheetDragY, setSheetDragY] = useState(0);
   const dragStartYRef = useRef<number | null>(null);
+  const [tgDebug, setTgDebug] = useState<{
+    platform: string;
+    hasInitData: boolean;
+    user: unknown;
+    url: string;
+    userAgent: string;
+    tickLabel: string;
+  }>({
+    platform: '-',
+    hasInitData: false,
+    user: null,
+    url: '',
+    userAgent: '',
+    tickLabel: '0s',
+  });
 
   const loadProfileData = async () => {
     const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
@@ -144,6 +159,37 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         : prev
     );
   }, [currentUser.id, currentUser.coins, currentUser.is_owner]);
+
+  useEffect(() => {
+    const readSnapshot = (tickLabel: string) => {
+      try {
+        const win = typeof window !== 'undefined' ? (window as any) : null;
+        const tgWebApp = win?.Telegram?.WebApp;
+        const rawInitData = typeof tgWebApp?.initData === 'string' ? tgWebApp.initData : '';
+        const rawUser = tgWebApp?.initDataUnsafe?.user ?? null;
+        setTgDebug({
+          platform: String(tgWebApp?.platform ?? 'tidak ada'),
+          hasInitData: Boolean(rawInitData && rawInitData.trim().length > 0),
+          user: rawUser && Object.keys(rawUser).length > 0 ? rawUser : null,
+          url: typeof window !== 'undefined' ? window.location.href : '',
+          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+          tickLabel,
+        });
+      } catch {
+        // Ignore Telegram debug read error
+      }
+    };
+
+    readSnapshot('0s');
+    const t1 = setTimeout(() => readSnapshot('1s'), 1000);
+    const t2 = setTimeout(() => readSnapshot('2s'), 2000);
+    const t3 = setTimeout(() => readSnapshot('3s'), 3000);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, []);
 
   const isMe = profile?.id === currentUser.id;
 
@@ -792,6 +838,57 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             </>
           )}
         </div>
+
+        {/* Temporary Debug Telegram Box (only on own profile) */}
+        {isMe && (
+          <div
+            className="mt-3 rounded-[10px] border p-2.5 text-[11px] leading-[1.45] font-mono break-all"
+            style={{
+              background: 'var(--nz-elevated)',
+              borderColor: 'var(--nz-border)',
+              color: 'var(--nz-text)',
+            }}
+          >
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="font-sans text-[11px] font-bold tracking-wide uppercase" style={{ color: 'var(--nz-accent-text)' }}>
+                DEBUG TELEGRAM
+              </span>
+              <span className="text-[10px]" style={{ color: 'var(--nz-text-muted)' }}>
+                update: {tgDebug.tickLabel}
+              </span>
+            </div>
+            <div className="space-y-1">
+              <div>
+                <span style={{ color: 'var(--nz-text-muted)' }}>platform: </span>
+                <span>{tgDebug.platform}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--nz-text-muted)' }}>initData: </span>
+                <span>{tgDebug.hasInitData ? 'ada' : 'tidak ada'}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--nz-text-muted)' }}>user: </span>
+                {tgDebug.user ? (
+                  <pre className="mt-1 p-1.5 rounded bg-black/40 text-[10.5px] whitespace-pre-wrap break-all overflow-x-auto">
+                    {JSON.stringify(tgDebug.user, null, 2)}
+                  </pre>
+                ) : (
+                  <span className="font-sans font-bold text-[#FF453A]">
+                    USER KOSONG - Telegram tidak mengirim data
+                  </span>
+                )}
+              </div>
+              <div>
+                <span style={{ color: 'var(--nz-text-muted)' }}>URL: </span>
+                <span>{tgDebug.url}</span>
+              </div>
+              <div>
+                <span style={{ color: 'var(--nz-text-muted)' }}>userAgent: </span>
+                <span>{tgDebug.userAgent}</span>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Tabs: Postingan & Repost */}
