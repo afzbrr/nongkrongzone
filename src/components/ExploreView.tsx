@@ -10,12 +10,14 @@ interface ExploreViewProps {
   currentUser: Player;
   onOpenProfile: (username: string) => void;
   onOpenComments: (post: Post) => void;
+  onRequireTelegram?: () => void;
 }
 
 export const ExploreView: React.FC<ExploreViewProps> = ({
   currentUser,
   onOpenProfile,
   onOpenComments,
+  onRequireTelegram,
 }) => {
   const [query, setQuery] = useState('');
   const [peopleTab, setPeopleTab] = useState<'members' | 'leaderboard'>('members');
@@ -51,6 +53,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   }, [query, currentUser.id]);
 
   const handleFollow = async (target: Player) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     await api.follow(target.id);
     setPlayers((prev) =>
       prev.map((p) => (p.id === target.id ? { ...p, is_following: true } : p))
@@ -58,6 +64,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   };
 
   const handleConfirmUnfollow = async () => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     if (!unfollowTarget) return;
     await api.unfollow(unfollowTarget.id);
     setPlayers((prev) =>
@@ -67,6 +77,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   };
 
   const handleToggleLike = async (post: Post) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     const res = await api.togglePostLike(post.id);
     setPosts((prev) =>
       prev.map((p) =>
@@ -260,6 +274,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
               onToggleLike={handleToggleLike}
               onOpenComments={onOpenComments}
               onRepost={async (orig, cap) => {
+                if (currentUser.is_guest) {
+                  onRequireTelegram?.();
+                  return;
+                }
                 await api.createPost({
                   original_post_id: orig.id,
                   repost_caption: cap || undefined,
@@ -268,10 +286,18 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 loadExplore(query.trim());
               }}
               onDeletePost={async (id) => {
+                if (currentUser.is_guest) {
+                  onRequireTelegram?.();
+                  return;
+                }
                 await api.deletePost(id);
                 setPosts((prev) => prev.filter((p) => p.id !== id));
               }}
               onBlockUser={async (target) => {
+                if (currentUser.is_guest) {
+                  onRequireTelegram?.();
+                  return;
+                }
                 await api.block(target.id);
                 loadExplore(query.trim());
               }}

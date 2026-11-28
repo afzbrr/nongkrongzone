@@ -13,6 +13,7 @@ interface CommentsSheetProps {
   onClose: () => void;
   onOpenProfile: (username: string) => void;
   onCommentsCountChange: (postId: string, newCount: number) => void;
+  onRequireTelegram?: () => void;
 }
 
 interface CommentNodeProps {
@@ -149,6 +150,7 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
   onClose,
   onOpenProfile,
   onCommentsCountChange,
+  onRequireTelegram,
 }) => {
   const [comments, setComments] = useState<PostComment[]>([]);
   const [loading, setLoading] = useState(false);
@@ -188,6 +190,10 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     if (!text.trim() || sending) return;
     setSending(true);
     try {
@@ -202,6 +208,10 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
   };
 
   const handleToggleLike = async (commentId: string) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     const res = await api.toggleCommentLike(commentId);
     setComments((prev) =>
       prev.map((c) =>
@@ -211,6 +221,10 @@ export const CommentsSheet: React.FC<CommentsSheetProps> = ({
   };
 
   const handleDelete = async (commentId: string) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     await api.deleteComment(commentId);
     setComments((prev) =>
       prev.map((c) =>

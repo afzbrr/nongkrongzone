@@ -22,6 +22,7 @@ export interface Player {
   has_blocked_me?: boolean;
   has_telegram_username?: boolean;
   follows_owner?: boolean;
+  is_guest?: boolean;
 }
 
 export interface BorderItem {

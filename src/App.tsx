@@ -29,8 +29,16 @@ import {
   isStaticSpaHost,
   setActivePlayerId,
   setActiveSessionToken,
+  setGuestMode,
   setNoOwnerFallback,
 } from './services/api';
+import {
+  buildGuestPlayerFromLocal,
+  initTelegramWebAppSafe,
+  persistProfileEditsLocally,
+  readTelegramClientAuthSafe,
+  syncTelegramUserWithLocalProfile,
+} from './services/telegramProfile';
 import { BordersProvider } from './context/BordersContext';
 import { StoryBar } from './components/StoryBar';
 import { StoryViewer } from './components/StoryViewer';
@@ -110,10 +118,21 @@ export default function App() {
     []
   );
 
-  const openTransferModal = useCallback((recipient?: Player | null) => {
-    setTransferInitialRecipient(recipient ?? null);
-    setTransferOpen(true);
-  }, []);
+  const openTransferModal = useCallback(
+    (recipient?: Player | null) => {
+      if (currentUser?.is_guest) {
+        showTransferToast({
+          id: `tg-only-${Date.now()}`,
+          kind: 'sent',
+          text: 'Buka NONGKRONG ZONE lewat Bot Telegram untuk transfer coin.',
+        });
+        return;
+      }
+      setTransferInitialRecipient(recipient ?? null);
+      setTransferOpen(true);
+    },
+    [currentUser?.is_guest, showTransferToast]
+  );
 
   // Notifications & Real-Time WebSocket
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -229,79 +248,23 @@ export default function App() {
   const resolvedByServerRef = useRef(false);
 
   const extractTelegramAuth = useCallback(() => {
-    const win = typeof window !== 'undefined' ? (window as any) : null;
-    const tgWebApp = win?.Telegram?.WebApp;
-    try {
-      tgWebApp?.ready?.();
-      tgWebApp?.expand?.();
-    } catch {
-      // ignore WebApp API errors
-    }
-
-    let initData = typeof tgWebApp?.initData === 'string' ? tgWebApp.initData : '';
-    let tgUser = tgWebApp?.initDataUnsafe?.user;
-
-    if (!initData && typeof window !== 'undefined') {
-      try {
-        const hashRaw = window.location.hash.replace(/^#/, '');
-        const hashParams = new URLSearchParams(hashRaw);
-        const searchParams = new URLSearchParams(window.location.search);
-        const fromParams = hashParams.get('tgWebAppData') || searchParams.get('tgWebAppData');
-        if (fromParams) {
-          initData = fromParams;
-        } else if (hashParams.get('user') || searchParams.get('user')) {
-          initData = hashParams.get('user') ? hashRaw : window.location.search.replace(/^\?/, '');
-        }
-      } catch {
-        // ignore url parse errors
-      }
-    }
-
-    if (!initData && typeof window !== 'undefined') {
-      try {
-        const rawInitParams = window.sessionStorage.getItem('__telegram__initParams');
-        if (rawInitParams) {
-          const parsedParams = JSON.parse(rawInitParams);
-          if (typeof parsedParams?.tgWebAppData === 'string' && parsedParams.tgWebAppData) {
-            initData = parsedParams.tgWebAppData;
-          }
-        }
-      } catch {
-        // ignore sessionStorage errors
-      }
-    }
-
-    if ((!tgUser || !tgUser.id) && initData) {
-      try {
-        const normalizedInit =
-          initData.includes('%3D') && !initData.includes('=')
-            ? decodeURIComponent(initData)
-            : initData;
-        const params = new URLSearchParams(normalizedInit);
-        const rawUser = params.get('user');
-        if (rawUser) {
-          const decodedUser = rawUser.startsWith('%') ? decodeURIComponent(rawUser) : rawUser;
-          tgUser = JSON.parse(decodedUser);
-        }
-      } catch {
-        // ignore user JSON parse errors
-      }
-    }
-
-    const platform = String(tgWebApp?.platform || '').toLowerCase();
-    const isTelegramEnv = Boolean(
-      initData ||
-        tgUser?.id ||
-        (platform && platform !== 'unknown') ||
-        win?.TelegramWebviewProxy ||
-        (typeof navigator !== 'undefined' && /Telegram/i.test(navigator.userAgent)) ||
-        (typeof window !== 'undefined' &&
-          (window.location.hash.includes('tgWebAppData') ||
-            window.location.search.includes('tgWebAppData')))
-    );
-
-    return { initData, tgUser, hasTgWebApp: Boolean(tgWebApp), isTelegramEnv };
+    return readTelegramClientAuthSafe();
   }, []);
+
+  const enterGuestMode = useCallback(() => {
+    const guestPlayer = buildGuestPlayerFromLocal();
+    resolvedByServerRef.current = true;
+    autoRetryCountRef.current = 0;
+    setActivePlayerId(null);
+    setActiveSessionToken(null);
+    setNoOwnerFallback(true);
+    setGuestMode(true);
+    setOwnerPlayer(null);
+    setCurrentUser(guestPlayer);
+    setAllPlayers([guestPlayer]);
+    setBootState('ready');
+    loadFeedAndStories().catch(() => {});
+  }, [loadFeedAndStories]);
 
   const bootstrap = useCallback(
     async (backgroundRefresh = false) => {
@@ -309,6 +272,7 @@ export default function App() {
         resolvedByServerRef.current = false;
         setActivePlayerId(null);
         setActiveSessionToken(null);
+        setGuestMode(false);
         setBootState('loading');
         setBootError(null);
         setSlowLoading(false);
@@ -371,13 +335,13 @@ export default function App() {
         } else if (allowOwnerPreview) {
           meRes = await api.getMe();
         } else {
-          resolvedByServerRef.current = true;
-          setBootState('telegram_required');
+          enterGuestMode();
           return;
         }
 
         resolvedByServerRef.current = true;
         autoRetryCountRef.current = 0;
+        setGuestMode(false);
         setActivePlayerId(meRes.player.id);
         if (meRes.sessionToken) {
           setActiveSessionToken(meRes.sessionToken);
@@ -385,10 +349,31 @@ export default function App() {
         const tgHasUser = tgUser?.id
           ? Boolean(typeof tgUser?.username === 'string' && tgUser.username.trim())
           : undefined;
-        const resolvedPlayer: Player = {
+        let resolvedPlayer: Player = {
           ...meRes.player,
           has_telegram_username: meRes.player.has_telegram_username ?? tgHasUser ?? true,
         };
+
+        if (tgUser?.id) {
+          const synced = syncTelegramUserWithLocalProfile(tgUser, resolvedPlayer);
+          resolvedPlayer = {
+            ...resolvedPlayer,
+            name: synced.resolvedName,
+            full_name: synced.resolvedName,
+            avatar_url: synced.resolvedAvatarUrl,
+            username: synced.resolvedUsername,
+            has_telegram_username: synced.hasTelegramUsername,
+          };
+          if (synced.needsServerSync) {
+            api
+              .updateMe({
+                full_name: synced.resolvedName,
+                avatar_url: synced.resolvedAvatarUrl,
+              })
+              .catch(() => {});
+          }
+        }
+
         const resolvedOwner =
           meRes.ownerPlayer ||
           (meRes.players || []).find((p) => p.is_owner || p.telegram_id === 6189849073) ||
@@ -415,10 +400,7 @@ export default function App() {
               setBootState('unconfigured');
               return;
             }
-            if (!backgroundRefresh) {
-              setBootError('Server API merespons halaman HTML. Silakan coba muat ulang.');
-              setBootState('error');
-            }
+            enterGuestMode();
             return;
           } catch (healthErr: any) {
             if (healthErr?.isSpaFallbackHtml) {
@@ -426,22 +408,17 @@ export default function App() {
               setBootState('static_host');
               return;
             }
-            if (!backgroundRefresh) {
-              setBootError(healthErr?.message || 'Gagal terhubung ke server API');
-              setBootState('error');
-            }
+            enterGuestMode();
             return;
           }
         } else if (err?.code === 'TELEGRAM_AUTH_REQUIRED' || err?.status === 401) {
-          resolvedByServerRef.current = true;
-          setBootState('telegram_required');
+          enterGuestMode();
         } else if (!backgroundRefresh) {
-          setBootError(err?.message || 'Gagal terhubung ke server');
-          setBootState('error');
+          enterGuestMode();
         }
       }
     },
-    [extractTelegramAuth, loadFeedAndStories, loadNotificationsAndChats]
+    [enterGuestMode, extractTelegramAuth, loadFeedAndStories, loadNotificationsAndChats]
   );
 
   // Map any direct/refreshed SPA path via JS state & normalize URL to "/" without page reload
@@ -468,13 +445,7 @@ export default function App() {
 
   useEffect(() => {
     document.title = 'NONGKRONG ZONE - Tempat Nongkrong Anak Muda';
-    try {
-      const tgWebApp = (window as any)?.Telegram?.WebApp;
-      tgWebApp?.ready?.();
-      tgWebApp?.expand?.();
-    } catch {
-      // ignore
-    }
+    initTelegramWebAppSafe();
     const fadeTimer = setTimeout(() => {
       setSplashPhase('fading');
     }, 2150);
@@ -512,7 +483,7 @@ export default function App() {
 
   // WebSocket real-time connection
   useEffect(() => {
-    if (!currentUser?.id || isStaticSpaHost()) return;
+    if (!currentUser?.id || currentUser.is_guest || isStaticSpaHost()) return;
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let wsOpened = false;
@@ -634,7 +605,7 @@ export default function App() {
 
   // Direct Supabase Realtime subscription (live broadcasts, giveaways, notifications, & balance without refresh)
   useEffect(() => {
-    if (!currentUser?.id || isStaticSpaHost()) return;
+    if (!currentUser?.id || currentUser.is_guest || isStaticSpaHost()) return;
     let cancelled = false;
     let activeChannel: any = null;
     let activeClient: any = null;
@@ -745,16 +716,39 @@ export default function App() {
   }, []);
 
   const handleCurrentUserUpdated = (updated: Player) => {
-    setCurrentUser((prev) => ({
+    const merged: Player = {
       ...updated,
-      has_telegram_username: updated.has_telegram_username ?? prev?.has_telegram_username,
-      follows_owner: updated.follows_owner ?? prev?.follows_owner,
-    }));
-    setAllPlayers((prev) => prev.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)));
-    loadFeedAndStories();
+      has_telegram_username: updated.has_telegram_username ?? currentUser?.has_telegram_username,
+      follows_owner: updated.follows_owner ?? currentUser?.follows_owner,
+      is_guest: updated.is_guest ?? currentUser?.is_guest,
+    };
+    setCurrentUser(merged);
+    persistProfileEditsLocally({
+      player: merged,
+      name: merged.name,
+      avatar_url: merged.avatar_url,
+      username: merged.username,
+      bio: merged.bio || '',
+    });
+    if (!merged.is_guest) {
+      setAllPlayers((prev) => prev.map((p) => (p.id === merged.id ? { ...p, ...merged } : p)));
+      loadFeedAndStories();
+    }
   };
 
+  const requireTelegramToast = useCallback(() => {
+    showTransferToast({
+      id: `tg-only-${Date.now()}`,
+      kind: 'sent',
+      text: 'Buka NONGKRONG ZONE lewat Bot Telegram untuk fitur ini.',
+    });
+  }, [showTransferToast]);
+
   const handleToggleLike = async (post: Post) => {
+    if (currentUser?.is_guest) {
+      requireTelegramToast();
+      return;
+    }
     const res = await api.togglePostLike(post.id);
     setPosts((prev) =>
       prev.map((p) =>
@@ -764,6 +758,10 @@ export default function App() {
   };
 
   const handleRepost = async (origPost: Post, repostCaption: string) => {
+    if (currentUser?.is_guest) {
+      requireTelegramToast();
+      return;
+    }
     const res = await api.createPost({
       original_post_id: origPost.id,
       repost_caption: repostCaption || undefined,
@@ -776,11 +774,19 @@ export default function App() {
   };
 
   const handleDeletePost = async (postId: string) => {
+    if (currentUser?.is_guest) {
+      requireTelegramToast();
+      return;
+    }
     await api.deletePost(postId);
     setPosts((prev) => prev.filter((p) => p.id !== postId));
   };
 
   const handleBlockUser = async (target: Player) => {
+    if (currentUser?.is_guest) {
+      requireTelegramToast();
+      return;
+    }
     const res = await api.block(target.id);
     if (
       !currentUser?.is_owner &&
@@ -1040,7 +1046,7 @@ export default function App() {
   );
 
   const mustFollowOwner = Boolean(
-    currentUser && !isCurrentUserOwner && currentUser.follows_owner !== true
+    currentUser && !currentUser.is_guest && !isCurrentUserOwner && currentUser.follows_owner !== true
   );
 
   return (
@@ -1107,6 +1113,10 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
+                if (currentUser?.is_guest) {
+                  requireTelegramToast();
+                  return;
+                }
                 loadNotificationsAndChats();
                 setNotifOpen(true);
               }}
@@ -1128,6 +1138,10 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
+                if (currentUser?.is_guest) {
+                  requireTelegramToast();
+                  return;
+                }
                 setChatInitialPeer(null);
                 setChatOpen(true);
               }}
@@ -1164,6 +1178,7 @@ export default function App() {
               onOwnerUnfollowed={handleOwnerUnfollowed}
               onOpenComments={setCommentsPost}
               onOpenTransferCoin={openTransferModal}
+              onRequireTelegram={requireTelegramToast}
             />
           ) : activeTab === 'feed' ? (
             <div className="pb-20">
@@ -1217,6 +1232,10 @@ export default function App() {
                   setOwnerPanelOpen(true);
                 }}
                 onClaimGiveaway={async (giveawayId) => {
+                  if (currentUser?.is_guest) {
+                    requireTelegramToast();
+                    return;
+                  }
                   const res = await api.claimGiveaway(giveawayId);
                   setCurrentUser((prev) =>
                     prev && !prev.is_owner
@@ -1236,7 +1255,13 @@ export default function App() {
                 currentUser={currentUser}
                 storyGroups={storyGroups}
                 onOpenStoryGroup={(idx) => setStoryViewerIndex(idx)}
-                onCreateStory={() => setCreateMode('story')}
+                onCreateStory={() => {
+                  if (currentUser?.is_guest) {
+                    requireTelegramToast();
+                    return;
+                  }
+                  setCreateMode('story');
+                }}
               />
 
               {loadingFeed && posts.length === 0 ? (
@@ -1288,6 +1313,7 @@ export default function App() {
               currentUser={currentUser}
               onOpenProfile={handleOpenProfile}
               onOpenComments={setCommentsPost}
+              onRequireTelegram={requireTelegramToast}
             />
           ) : activeTab === 'borders' ? (
             <BordersView
@@ -1319,6 +1345,7 @@ export default function App() {
                 loadOwnerPanelState();
                 setOwnerPanelOpen(true);
               }}
+              onRequireTelegram={requireTelegramToast}
             />
           )}
         </main>
@@ -1363,7 +1390,13 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setCreateMode('post')}
+              onClick={() => {
+                if (currentUser?.is_guest) {
+                  requireTelegramToast();
+                  return;
+                }
+                setCreateMode('post');
+              }}
               className="h-full flex flex-col items-center justify-center gap-0.5 transition-colors"
               style={{ color: 'var(--nz-text-muted)' }}
               aria-label="Post"
@@ -1431,6 +1464,7 @@ export default function App() {
           currentUser={currentUser}
           onClose={() => setCommentsPost(null)}
           onOpenProfile={handleOpenProfile}
+          onRequireTelegram={requireTelegramToast}
           onCommentsCountChange={(postId, count) => {
             setPosts((prev) =>
               prev.map((p) => (p.id === postId ? { ...p, comments_count: count } : p))

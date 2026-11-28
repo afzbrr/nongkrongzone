@@ -19,6 +19,7 @@ import type {
 let activePlayerIdMemory: string | null = null;
 let activeSessionTokenMemory: string | null = null;
 let noOwnerFallbackMemory = false;
+let guestModeMemory = false;
 
 export function isStaticSpaHost(): boolean {
   return false;
@@ -26,6 +27,10 @@ export function isStaticSpaHost(): boolean {
 
 export function setNoOwnerFallback(enabled: boolean) {
   noOwnerFallbackMemory = enabled;
+}
+
+export function setGuestMode(enabled: boolean) {
+  guestModeMemory = enabled;
 }
 
 export function setActivePlayerId(id: string | null) {
@@ -69,6 +74,9 @@ async function apiFetch<T>(
     }
     if (noOwnerFallbackMemory) {
       headers['x-no-owner-fallback'] = '1';
+    }
+    if (guestModeMemory) {
+      headers['x-guest-mode'] = '1';
     }
 
     const controller = new AbortController();

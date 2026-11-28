@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import type { Player, Post } from '../types';
 import { api, uploadMediaFile } from '../services/api';
+import { compressImageFileToDataUrl, persistProfileEditsLocally } from '../services/telegramProfile';
 import { useBorders } from '../context/BordersContext';
 import { THEMES, useTheme } from '../context/ThemeContext';
 import { formatNumber, getInitials, sanitizeMediaUrl } from '../utils/format';
@@ -40,6 +41,7 @@ interface ProfileViewProps {
   onOpenBorders?: () => void;
   onOpenTransferCoin?: (initialRecipient?: Player | null) => void;
   onOpenOwnerPanel?: () => void;
+  onRequireTelegram?: () => void;
 }
 
 export const ProfileView: React.FC<ProfileViewProps> = ({
@@ -54,6 +56,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   onOpenBorders,
   onOpenTransferCoin,
   onOpenOwnerPanel,
+  onRequireTelegram,
 }) => {
   const { bordersById } = useBorders();
   const { theme, setThemeId } = useTheme();
@@ -86,6 +89,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   const loadProfileData = async () => {
     const isOwnByUsername = username.toLowerCase() === currentUser.username.toLowerCase();
+    if (currentUser.is_guest && isOwnByUsername) {
+      setProfile(currentUser);
+      setPosts([]);
+      setLoading(false);
+      return;
+    }
     if (isOwnByUsername && !profile) {
       setProfile(currentUser);
       setLoading(false);
@@ -94,9 +103,16 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     }
     try {
       const pRes = await api.getPlayerProfile(username);
-      setProfile(pRes.player);
-      if (!pRes.player.is_blocked_by_me && !pRes.player.has_blocked_me) {
-        const postsRes = await api.getPosts({ playerId: pRes.player.id });
+      const mergedProfile: Player = isOwnByUsername
+        ? {
+            ...pRes.player,
+            has_telegram_username:
+              pRes.player.has_telegram_username ?? currentUser.has_telegram_username,
+          }
+        : pRes.player;
+      setProfile(mergedProfile);
+      if (!mergedProfile.is_blocked_by_me && !mergedProfile.has_blocked_me) {
+        const postsRes = await api.getPosts({ playerId: mergedProfile.id });
         setPosts(postsRes.posts);
       } else {
         setPosts([]);
@@ -132,6 +148,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   const isMe = profile?.id === currentUser.id;
 
   const handleFollow = async () => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     if (!profile) return;
     await api.follow(profile.id);
     setProfile((prev) =>
@@ -146,6 +166,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const handleConfirmUnfollow = async () => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     if (!profile) return;
     const res = await api.unfollow(profile.id);
     setUnfollowConfirmOpen(false);
@@ -165,6 +189,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const handleBlockToggle = async () => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     if (!profile) return;
     if (profile.is_blocked_by_me) {
       await api.unblock(profile.id);
@@ -215,6 +243,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const handleToggleLike = async (post: Post) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     const res = await api.togglePostLike(post.id);
     setPosts((prev) =>
       prev.map((p) =>
@@ -224,6 +256,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
   };
 
   const handleRepost = async (origPost: Post, repostCaption: string) => {
+    if (currentUser.is_guest) {
+      onRequireTelegram?.();
+      return;
+    }
     await api.createPost({
       original_post_id: origPost.id,
       repost_caption: repostCaption || undefined,
@@ -240,6 +276,60 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
     );
   };
 
+  const handleAvatarFileSelected = async (
+    file: File,
+    applyImmediately: boolean
+  ): Promise<void> => {
+    setUploadingAvatar(true);
+    setEditNotice(null);
+    try {
+      let nextUrl = '';
+      if (currentUser.is_guest) {
+        nextUrl = await compressImageFileToDataUrl(file, 360);
+      } else {
+        try {
+          const res = await uploadMediaFile(file);
+          nextUrl = res.url;
+        } catch {
+          nextUrl = await compressImageFileToDataUrl(file, 360);
+        }
+      }
+      setEditAvatar(nextUrl);
+      if (applyImmediately && profile) {
+        if (currentUser.is_guest) {
+          const updatedGuest: Player = {
+            ...currentUser,
+            avatar_url: nextUrl || null,
+          };
+          persistProfileEditsLocally({
+            player: updatedGuest,
+            avatar_url: nextUrl || null,
+            markAvatarEdited: true,
+          });
+          setProfile(updatedGuest);
+          onCurrentUserUpdated(updatedGuest);
+        } else {
+          const res = await api.updateMe({ avatar_url: nextUrl || null });
+          const updatedPlayer: Player = {
+            ...res.player,
+            has_telegram_username: res.player.has_telegram_username ?? profile.has_telegram_username,
+          };
+          persistProfileEditsLocally({
+            player: updatedPlayer,
+            avatar_url: updatedPlayer.avatar_url,
+            markAvatarEdited: true,
+          });
+          setProfile(updatedPlayer);
+          onCurrentUserUpdated(updatedPlayer);
+        }
+      }
+    } catch (err: any) {
+      setEditNotice(err?.message || 'Gagal mengunggah foto');
+    } finally {
+      setUploadingAvatar(false);
+    }
+  };
+
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanedName = editName.trim().slice(0, 20);
@@ -247,6 +337,29 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       setEditNotice('Nama tidak boleh kosong');
       return;
     }
+
+    if (currentUser.is_guest) {
+      const updatedGuest: Player = {
+        ...currentUser,
+        name: cleanedName,
+        full_name: cleanedName,
+        bio: editBio.trim().slice(0, 300),
+        avatar_url: editAvatar || null,
+      };
+      persistProfileEditsLocally({
+        player: updatedGuest,
+        name: cleanedName,
+        avatar_url: editAvatar || null,
+        bio: updatedGuest.bio || '',
+        markNameEdited: true,
+        markAvatarEdited: (editAvatar || null) !== (profile?.avatar_url || null),
+      });
+      setProfile(updatedGuest);
+      onCurrentUserUpdated(updatedGuest);
+      setEditOpen(false);
+      return;
+    }
+
     const canEditUsername = profile?.has_telegram_username === false;
     let cleanedUsername: string | undefined;
     if (canEditUsername) {
@@ -275,6 +388,17 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
         ...res.player,
         has_telegram_username: res.player.has_telegram_username ?? profile?.has_telegram_username,
       };
+      persistProfileEditsLocally({
+        player: updatedPlayer,
+        name: updatedPlayer.name,
+        avatar_url: updatedPlayer.avatar_url,
+        username: updatedPlayer.username,
+        bio: updatedPlayer.bio || '',
+        markNameEdited: true,
+        markAvatarEdited:
+          (editAvatar || null) !== (profile?.telegram_avatar_url || null) ||
+          (editAvatar || null) !== (profile?.avatar_url || null),
+      });
       setProfile(updatedPlayer);
       onCurrentUserUpdated(updatedPlayer);
       setEditOpen(false);
@@ -443,7 +567,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             className="flex items-center gap-2.5 mt-0.5 text-[12.5px] flex-wrap"
             style={{ color: 'var(--nz-text-muted)' }}
           >
-            <span>@{profile.username}</span>
+            <span>{profile.is_guest || profile.username === '-' ? '-' : `@${profile.username}`}</span>
             <span aria-hidden="true">·</span>
             <CoinDisplay
               coins={profile.balance ?? profile.coins}
@@ -454,7 +578,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   String(profile.username || '').toLowerCase() === 'afz'
               )}
             />
-            {isMe && onOpenTransferCoin && (
+            {isMe && !profile.is_guest && onOpenTransferCoin && (
               <button
                 type="button"
                 onClick={() => onOpenTransferCoin(null)}
@@ -502,7 +626,31 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 <span>Edit Profil</span>
               </button>
 
-              {onOpenBorders && (
+              <label
+                className="h-8 px-3.5 rounded-full border text-[12px] font-semibold flex items-center gap-1.5 cursor-pointer hover:opacity-90"
+                style={{
+                  background: 'var(--nz-card)',
+                  borderColor: 'var(--nz-border)',
+                  color: 'var(--nz-text)',
+                }}
+              >
+                <ImagePlus className="w-3.5 h-3.5" strokeWidth={1.5} />
+                <span>{uploadingAvatar ? 'Mengunggah...' : 'Ganti Foto'}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  disabled={uploadingAvatar}
+                  className="hidden"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = '';
+                    if (!f) return;
+                    await handleAvatarFileSelected(f, true);
+                  }}
+                />
+              </label>
+
+              {!profile.is_guest && onOpenBorders && (
                 <button
                   type="button"
                   onClick={onOpenBorders}
@@ -514,7 +662,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 </button>
               )}
 
-              {onOpenTransferCoin && (
+              {!profile.is_guest && onOpenTransferCoin && (
                 <button
                   type="button"
                   onClick={() => onOpenTransferCoin(null)}
@@ -530,7 +678,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 </button>
               )}
 
-              {onOpenOwnerPanel &&
+              {!profile.is_guest &&
+                onOpenOwnerPanel &&
                 Boolean(
                   profile.is_owner ||
                     profile.role === 'owner' ||
@@ -547,23 +696,25 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   </button>
                 )}
 
-              <button
-                type="button"
-                onClick={async () => {
-                  const res = await api.getBlockedPlayers();
-                  setBlockedList(res.players);
-                  setBlockedModalOpen(true);
-                }}
-                className="h-8 px-3.5 rounded-full border text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
-                style={{
-                  background: 'var(--nz-card)',
-                  borderColor: 'var(--nz-border)',
-                  color: 'var(--nz-text-muted)',
-                }}
-              >
-                <Shield className="w-3.5 h-3.5" strokeWidth={1.5} />
-                <span>Diblokir</span>
-              </button>
+              {!profile.is_guest && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const res = await api.getBlockedPlayers();
+                    setBlockedList(res.players);
+                    setBlockedModalOpen(true);
+                  }}
+                  className="h-8 px-3.5 rounded-full border text-[12px] font-semibold flex items-center gap-1.5 hover:opacity-90"
+                  style={{
+                    background: 'var(--nz-card)',
+                    borderColor: 'var(--nz-border)',
+                    color: 'var(--nz-text-muted)',
+                  }}
+                >
+                  <Shield className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  <span>Diblokir</span>
+                </button>
+              )}
             </>
           ) : (
             <>
@@ -595,7 +746,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => onOpenChatWith(profile)}
+                    onClick={() => {
+                      if (currentUser.is_guest) {
+                        onRequireTelegram?.();
+                        return;
+                      }
+                      onOpenChatWith(profile);
+                    }}
                     className="h-[28px] px-[14px] rounded-full border text-[12px] font-semibold flex items-center gap-1.5"
                     style={{
                       background: 'var(--nz-card)',
@@ -904,7 +1061,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                     }}
                   >
                     <ImagePlus className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    <span>{uploadingAvatar ? 'Mengunggah foto...' : 'Upload Foto Baru dari Galeri'}</span>
+                    <span>{uploadingAvatar ? 'Mengunggah foto...' : 'Ganti Foto'}</span>
                     <input
                       type="file"
                       accept="image/*"
@@ -912,43 +1069,36 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                       className="hidden"
                       onChange={async (e) => {
                         const f = e.target.files?.[0];
+                        e.target.value = '';
                         if (!f) return;
-                        setUploadingAvatar(true);
-                        setEditNotice(null);
-                        try {
-                          const res = await uploadMediaFile(f);
-                          setEditAvatar(res.url);
-                        } catch (err: any) {
-                          setEditNotice(err?.message || 'Gagal mengunggah foto');
-                        } finally {
-                          setUploadingAvatar(false);
-                          e.target.value = '';
-                        }
+                        await handleAvatarFileSelected(f, false);
                       }}
                     />
                   </label>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const tgPhoto = profile.telegram_avatar_url || '';
-                      setEditAvatar(tgPhoto);
-                      setEditNotice(
-                        tgPhoto
-                          ? 'Foto dikembalikan ke foto Telegram asli. Tekan Simpan untuk menerapkan.'
-                          : 'Foto Telegram asli tidak tersedia, foto direset ke default.'
-                      );
-                    }}
-                    className="h-8 px-3 rounded-[10px] border text-[11.5px] font-medium inline-flex items-center justify-center gap-1.5 hover:opacity-90"
-                    style={{
-                      background: 'var(--nz-card)',
-                      borderColor: 'var(--nz-border)',
-                      color: 'var(--nz-text-muted)',
-                    }}
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" strokeWidth={1.75} />
-                    <span>Balikin ke Foto Telegram</span>
-                  </button>
+                  {!profile.is_guest && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const tgPhoto = profile.telegram_avatar_url || '';
+                        setEditAvatar(tgPhoto);
+                        setEditNotice(
+                          tgPhoto
+                            ? 'Foto dikembalikan ke foto Telegram asli. Tekan Simpan untuk menerapkan.'
+                            : 'Foto Telegram asli tidak tersedia, foto direset ke default.'
+                        );
+                      }}
+                      className="h-8 px-3 rounded-[10px] border text-[11.5px] font-medium inline-flex items-center justify-center gap-1.5 hover:opacity-90"
+                      style={{
+                        background: 'var(--nz-card)',
+                        borderColor: 'var(--nz-border)',
+                        color: 'var(--nz-text-muted)',
+                      }}
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" strokeWidth={1.75} />
+                      <span>Balikin ke Foto Telegram</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -975,8 +1125,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               />
             </label>
 
-            {/* Username: editable jika Telegram tidak punya username, terkunci jika punya username Telegram */}
-            {profile.has_telegram_username === false ? (
+            {/* Username: editable jika Telegram tidak punya username, terkunci jika punya username Telegram atau mode Guest */}
+            {!profile.is_guest && profile.has_telegram_username === false ? (
               <label className="flex flex-col gap-1 text-[12px]" style={{ color: 'var(--nz-text-muted)' }}>
                 <div className="flex items-center justify-between">
                   <span>Username (Bisa Diubah)</span>
@@ -1017,7 +1167,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 <div className="relative flex items-center">
                   <input
                     type="text"
-                    value={`@${profile.username}`}
+                    value={profile.is_guest || profile.username === '-' ? '-' : `@${profile.username}`}
                     disabled
                     readOnly
                     aria-label="Username Telegram (tidak dapat diubah)"
@@ -1027,7 +1177,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   <Lock className="w-4 h-4 text-[#9CA3AF] absolute right-3 pointer-events-none" strokeWidth={1.75} />
                 </div>
                 <p className="text-[11px] leading-snug text-[#9CA3AF]">
-                  Username ngikutin akun Telegram, gak bisa diubah di sini. Kalau mau ganti, ganti di Telegram ya.
+                  Username mengikuti akun Telegram, tidak bisa diubah
                 </p>
               </div>
             )}

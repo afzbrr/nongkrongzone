@@ -813,6 +813,12 @@ function sanitizeUrl(val: unknown): string | null {
   if (trimmed.startsWith('/uploads/') || trimmed.startsWith('/src/assets/')) {
     return trimmed;
   }
+  if (
+    trimmed.length <= 600_000 &&
+    /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(trimmed)
+  ) {
+    return trimmed;
+  }
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
@@ -985,6 +991,15 @@ async function ensureOwnerAndResolvePlayer(sb: SupabaseClient, req: Request) {
   return normalizePlayer(insertedOwner);
 }
 
+async function resolveViewerOrGuest(sb: SupabaseClient, req: Request) {
+  const resolved = await resolveAuthenticatedPlayerOnly(sb, req);
+  if (resolved) return resolved;
+  if (req.header('x-guest-mode') === '1') {
+    return null;
+  }
+  return ensureOwnerAndResolvePlayer(sb, req);
+}
+
 async function getBlockedSet(sb: SupabaseClient, playerId: string): Promise<{
   blockedByMe: Set<string>;
   blockedMe: Set<string>;
@@ -1054,9 +1069,9 @@ function resolveAuthorFromRow(row: any, playersMap: Map<string, any>) {
   return null;
 }
 
-async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId: string) {
+async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId: string | null) {
   const normalizedTarget = normalizePlayer(targetPlayer);
-  const [{ count: followersCount }, { count: followingCount }, { count: postsCount }, { data: followRow }, blocks] =
+  const [{ count: followersCount }, { count: followingCount }, { count: postsCount }, followRes, blocks] =
     await Promise.all([
       sb.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', normalizedTarget.id),
       sb.from('follows').select('*', { count: 'exact', head: true }).eq('follower_id', normalizedTarget.id),
@@ -1065,13 +1080,21 @@ async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId
         .select('*', { count: 'exact', head: true })
         .eq('player_id', normalizedTarget.id)
         .eq('is_deleted', false),
-      sb
-        .from('follows')
-        .select('id')
-        .eq('follower_id', viewerId)
-        .eq('following_id', normalizedTarget.id)
-        .maybeSingle(),
-      getBlockedSet(sb, viewerId),
+      viewerId
+        ? sb
+            .from('follows')
+            .select('id')
+            .eq('follower_id', viewerId)
+            .eq('following_id', normalizedTarget.id)
+            .maybeSingle()
+        : Promise.resolve({ data: null }),
+      viewerId
+        ? getBlockedSet(sb, viewerId)
+        : Promise.resolve({
+            blockedByMe: new Set<string>(),
+            blockedMe: new Set<string>(),
+            anyBlocked: new Set<string>(),
+          }),
     ]);
 
   return {
@@ -1079,7 +1102,7 @@ async function enrichPlayerStats(sb: SupabaseClient, targetPlayer: any, viewerId
     followers_count: followersCount || 0,
     following_count: followingCount || 0,
     posts_count: postsCount || 0,
-    is_following: Boolean(followRow),
+    is_following: Boolean(followRes?.data),
     is_blocked_by_me: blocks.blockedByMe.has(normalizedTarget.id),
     has_blocked_me: blocks.blockedMe.has(normalizedTarget.id),
   };
@@ -1257,10 +1280,12 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const me = await resolveViewerOrGuest(sb, req);
       const [bordersRes, pbRes] = await Promise.all([
         sb.from('borders').select('*').order('price_coins', { ascending: true }),
-        sb.from('player_borders').select('*, borders(*)').eq('player_id', me.id),
+        me?.id
+          ? sb.from('player_borders').select('*, borders(*)').eq('player_id', me.id)
+          : Promise.resolve({ data: [] as any[], error: null }),
       ]);
 
       if (bordersRes.error) {
@@ -1283,14 +1308,14 @@ export async function createApp(): Promise<express.Express> {
         if (bannedNames.has(upperName)) return false;
         if (upperName.includes('NOBAR')) return false;
         const isFaizOwnerCard = upperId === 'FAIZ_OWNER' || upperName === 'FAIZ GANTENG';
-        if (isFaizOwnerCard && !me.is_owner) return false;
+        if (isFaizOwnerCard && !me?.is_owner) return false;
         // FAIZ_SPIDERMAN stays visible to everyone so regular users see "KHUSUS OWNER" and Owner gets it free
         return true;
       });
 
       const ownedRows = pbRes.data || [];
       const ownedSet = new Set<string>(ownedRows.map((r: any) => String(r.border_id)));
-      if (me.is_owner) {
+      if (me?.is_owner) {
         for (const b of allBorders) {
           ownedSet.add(String(b.id));
         }
@@ -1312,7 +1337,7 @@ export async function createApp(): Promise<express.Express> {
         };
       });
 
-      const collectionBorders = me.is_owner
+      const collectionBorders = me?.is_owner
         ? borders
         : ownedRows
             .map((r: any) => r.borders || allBorders.find((b: any) => String(b.id) === String(r.border_id)))
@@ -1323,8 +1348,8 @@ export async function createApp(): Promise<express.Express> {
         borders,
         collectionBorders,
         ownedIds: Array.from(ownedSet),
-        equippedBorderId: me.border_id || null,
-        coins: me.is_owner ? OWNER_COINS : Number(me.coins || 0),
+        equippedBorderId: me?.border_id || null,
+        coins: me?.is_owner ? OWNER_COINS : Number(me?.coins || 0),
         rawCount: allRawBorders.length,
         rlsHint:
           allRawBorders.length === 0 && !process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -2755,7 +2780,7 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const me = await resolveViewerOrGuest(sb, req);
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       let query = sb
         .from('players')
@@ -2772,14 +2797,22 @@ export async function createApp(): Promise<express.Express> {
         }
       }
 
-      const [{ data: rows, error }, { data: myFollows }, blocks] = await Promise.all([
+      const [{ data: rows, error }, followsRes, blocks] = await Promise.all([
         query,
-        sb.from('follows').select('following_id').eq('follower_id', me.id),
-        getBlockedSet(sb, me.id),
+        me?.id
+          ? sb.from('follows').select('following_id').eq('follower_id', me.id)
+          : Promise.resolve({ data: [] as any[] }),
+        me?.id
+          ? getBlockedSet(sb, me.id)
+          : Promise.resolve({
+              blockedByMe: new Set<string>(),
+              blockedMe: new Set<string>(),
+              anyBlocked: new Set<string>(),
+            }),
       ]);
 
       if (error) throw error;
-      const followingSet = new Set((myFollows || []).map((f) => f.following_id));
+      const followingSet = new Set((followsRes.data || []).map((f) => f.following_id));
 
       const players = (rows || []).map((p) => ({
         ...normalizePlayer(p),
@@ -2817,7 +2850,7 @@ export async function createApp(): Promise<express.Express> {
     const sb = getSupabase();
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const me = await resolveViewerOrGuest(sb, req);
       const identifier = req.params.identifier;
       const query = isUuid(identifier)
         ? sb.from('players').select('*').eq('id', identifier).maybeSingle()
@@ -2825,7 +2858,7 @@ export async function createApp(): Promise<express.Express> {
       const { data: target, error } = await query;
       if (error) throw error;
       if (!target) return res.status(404).json({ error: 'Pengguna tidak ditemukan' });
-      const enriched = await enrichPlayerStats(sb, target, me.id);
+      const enriched = await enrichPlayerStats(sb, target, me?.id || null);
       return res.json({ player: enriched });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Gagal memuat profil' });
@@ -3029,11 +3062,13 @@ export async function createApp(): Promise<express.Express> {
     }
 
     const postIds = visible.map((p) => p.id);
-    const likesPromise = caps.likesPlayerId
-      ? sb.from('post_likes').select('post_id').eq('player_id', viewer.id).in('post_id', postIds)
-      : caps.likesTelegramId && viewer.telegram_id
-        ? sb.from('post_likes').select('post_id').eq('telegram_id', viewer.telegram_id).in('post_id', postIds)
-        : Promise.resolve({ data: [] as any[] });
+    const likesPromise = !viewer
+      ? Promise.resolve({ data: [] as any[] })
+      : caps.likesPlayerId
+        ? sb.from('post_likes').select('post_id').eq('player_id', viewer.id).in('post_id', postIds)
+        : caps.likesTelegramId && viewer.telegram_id
+          ? sb.from('post_likes').select('post_id').eq('telegram_id', viewer.telegram_id).in('post_id', postIds)
+          : Promise.resolve({ data: [] as any[] });
 
     const commentsCountPromise = !caps.postsCommentsCount
       ? sb.from('post_comments').select('post_id').in('post_id', postIds)
@@ -3088,8 +3123,14 @@ export async function createApp(): Promise<express.Express> {
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const caps = await detectSchemaCaps(sb);
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
-      const blocks = await getBlockedSet(sb, me.id);
+      const me = await resolveViewerOrGuest(sb, req);
+      const blocks = me?.id
+        ? await getBlockedSet(sb, me.id)
+        : {
+            blockedByMe: new Set<string>(),
+            blockedMe: new Set<string>(),
+            anyBlocked: new Set<string>(),
+          };
       const playerIdFilter = typeof req.query.playerId === 'string' ? req.query.playerId : null;
       const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
 
@@ -3142,10 +3183,16 @@ export async function createApp(): Promise<express.Express> {
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const caps = await detectSchemaCaps(sb);
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const me = await resolveViewerOrGuest(sb, req);
       const postId = req.params.id;
       if (!isUuid(postId)) return res.status(400).json({ error: 'ID tidak valid' });
-      const blocks = await getBlockedSet(sb, me.id);
+      const blocks = me?.id
+        ? await getBlockedSet(sb, me.id)
+        : {
+            blockedByMe: new Set<string>(),
+            blockedMe: new Set<string>(),
+            anyBlocked: new Set<string>(),
+          };
       let q = sb.from('posts').select('*').eq('id', postId);
       if (caps.postsIsDeleted) q = q.eq('is_deleted', false);
       const { data: raw, error } = await q.maybeSingle();
@@ -3396,7 +3443,7 @@ export async function createApp(): Promise<express.Express> {
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const caps = await detectSchemaCaps(sb);
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
+      const me = await resolveViewerOrGuest(sb, req);
       const postId = req.params.id;
       if (!isUuid(postId)) return res.status(400).json({ error: 'ID tidak valid' });
 
@@ -3414,7 +3461,7 @@ export async function createApp(): Promise<express.Express> {
 
       const [playersMap, myLikesRes] = await Promise.all([
         getPlayersMap(sb, playerIds, tgIds),
-        commentIds.length > 0 && caps.commentsLikesCount
+        me?.id && commentIds.length > 0 && caps.commentsLikesCount
           ? sb
               .from('comment_likes')
               .select('comment_id')
@@ -3668,8 +3715,14 @@ export async function createApp(): Promise<express.Express> {
     if (!sb) return res.status(503).json({ error: 'SUPABASE_NOT_CONFIGURED' });
     try {
       const caps = await detectSchemaCaps(sb);
-      const me = await ensureOwnerAndResolvePlayer(sb, req);
-      const blocks = await getBlockedSet(sb, me.id);
+      const me = await resolveViewerOrGuest(sb, req);
+      const blocks = me?.id
+        ? await getBlockedSet(sb, me.id)
+        : {
+            blockedByMe: new Set<string>(),
+            blockedMe: new Set<string>(),
+            anyBlocked: new Set<string>(),
+          };
       const nowIso = new Date().toISOString();
 
       let query = sb
@@ -3735,7 +3788,7 @@ export async function createApp(): Promise<express.Express> {
         if (!player) continue;
         const groupKey = player.id;
         const viewersSet = viewsByStory.get(s.id) || new Set();
-        const viewedByMe = viewersSet.has(me.id);
+        const viewedByMe = Boolean(me?.id && viewersSet.has(me.id));
         const storyText = s.text ?? s.caption ?? null;
         const enrichedStory = {
           ...s,
@@ -3758,8 +3811,8 @@ export async function createApp(): Promise<express.Express> {
       }
 
       const storyGroups = Array.from(groupsMap.values()).sort((a, b) => {
-        if (a.player.id === me.id) return -1;
-        if (b.player.id === me.id) return 1;
+        if (me?.id && a.player.id === me.id) return -1;
+        if (me?.id && b.player.id === me.id) return 1;
         if (a.has_unseen !== b.has_unseen) return a.has_unseen ? -1 : 1;
         return 0;
       });
